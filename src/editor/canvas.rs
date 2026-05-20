@@ -102,10 +102,18 @@ impl Canvas {
         }
     }
 
-    pub fn render(&self, hwnd: HWND, hdc: HDC) {
+    /// Render the canvas into `hdc`. The canvas paints its own background in
+    /// logical (0,0) .. (self.size.0, self.size.1); the caller is responsible
+    /// for positioning via `SetViewportOrgEx` if the canvas is offset within
+    /// its host window (e.g. below a toolbar).
+    pub fn render(&self, _hwnd: HWND, hdc: HDC) {
         unsafe {
-            let mut rc: RECT = core::mem::zeroed();
-            GetClientRect(hwnd, &mut rc);
+            let rc = RECT {
+                left: 0,
+                top: 0,
+                right: self.size.0 as i32,
+                bottom: self.size.1 as i32,
+            };
 
             let bg = CreateSolidBrush(rgb_to_colorref(Color::rgb(0x1A, 0x1B, 0x1D)));
             FillRect(hdc, &rc, bg);

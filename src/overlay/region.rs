@@ -227,6 +227,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 paint(hwnd, st);
                 0
             }
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => {
+                // Suppress default erase — WM_PAINT double-buffers the entire
+                // window so no transient background is ever visible.
+                1
+            }
             WM_DESTROY => {
                 PostMessageW(0, WM_QUIT, 0, 0);
                 0
@@ -240,47 +245,44 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     unsafe {
         let mut ps: PAINTSTRUCT = core::mem::zeroed();
         let hdc = BeginPaint(hwnd, &mut ps);
-        let mut client: RECT = core::mem::zeroed();
-        GetClientRect(hwnd, &mut client);
 
-        // Blit desktop background.
-        BitBlt(hdc, 0, 0, st.width, st.height, st.desktop, 0, 0, SRCCOPY);
+        // Double-buffer the entire frame. The overlay paints in several steps
+        // (desktop background → tint → re-blit selection → outline → label);
+        // doing them directly to the window causes visible flicker on every
+        // mouse-move. Compose into a memory DC, then BitBlt once at the end.
+        use windows_sys::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateDIBSection,
+            DIB_RGB_COLORS,
+        };
+        let mem_dc = CreateCompatibleDC(hdc);
+        let mem_bmp = CreateCompatibleBitmap(hdc, st.width, st.height);
+        let old_bmp = SelectObject(mem_dc, mem_bmp as _);
 
-        // Tint everything outside the selection with semi-transparent dark overlay.
-        let tint_dc = CreateCompatibleDC(hdc);
-        let one_w = 1;
-        let one_h = 1;
-        use windows_sys::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS};
+        // Desktop background.
+        BitBlt(mem_dc, 0, 0, st.width, st.height, st.desktop, 0, 0, SRCCOPY);
+
+        // Tint pass via AlphaBlend with a 1×1 source DIB.
+        let tint_dc = CreateCompatibleDC(mem_dc);
         let mut bi: BITMAPINFO = core::mem::zeroed();
         bi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bi.bmiHeader.biWidth = one_w;
-        bi.bmiHeader.biHeight = -one_h;
+        bi.bmiHeader.biWidth = 1;
+        bi.bmiHeader.biHeight = -1;
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB as u32;
         let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-        let tint_bmp = CreateDIBSection(
-            0,
-            &bi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            0,
-            0,
-        );
+        let tint_bmp = CreateDIBSection(0, &bi, DIB_RGB_COLORS, &mut bits, 0, 0);
         if !bits.is_null() {
-            // BGRA: dark with alpha 140
-            *(bits as *mut u32) = 0x8C_00_00_00;
+            *(bits as *mut u32) = 0x8C_00_00_00; // BGRA, dark, alpha~140
         }
         let old_tint = SelectObject(tint_dc, tint_bmp as _);
-
         let blend = BLENDFUNCTION {
-            BlendOp: 0,        // AC_SRC_OVER
+            BlendOp: 0,
             BlendFlags: 0,
             SourceConstantAlpha: 140,
             AlphaFormat: 0,
         };
-        AlphaBlend(hdc, 0, 0, st.width, st.height, tint_dc, 0, 0, 1, 1, blend);
-
+        AlphaBlend(mem_dc, 0, 0, st.width, st.height, tint_dc, 0, 0, 1, 1, blend);
         SelectObject(tint_dc, old_tint);
         DeleteObject(tint_bmp as _);
         DeleteDC(tint_dc);
@@ -293,11 +295,10 @@ unsafe fn paint(hwnd: HWND, st: &State) {
             let w = (x1 - x0).abs();
             let h = (y1 - y0).abs();
             if w > 0 && h > 0 {
-                // Re-blit the unobscured selection (no tint).
-                BitBlt(hdc, x, y, w, h, st.desktop, x, y, SRCCOPY);
-                // Draw the rectangle outline.
-                let pen = CreatePen(PS_SOLID as i32, 2, 0x00FF66 /* greenish */);
-                let old_pen = SelectObject(hdc, pen as _);
+                BitBlt(mem_dc, x, y, w, h, st.desktop, x, y, SRCCOPY);
+
+                let pen = CreatePen(PS_SOLID as i32, 2, 0x00FF66);
+                let old_pen = SelectObject(mem_dc, pen as _);
                 let pts = [
                     windows_sys::Win32::Foundation::POINT { x, y },
                     windows_sys::Win32::Foundation::POINT { x: x + w, y },
@@ -305,22 +306,16 @@ unsafe fn paint(hwnd: HWND, st: &State) {
                     windows_sys::Win32::Foundation::POINT { x, y: y + h },
                     windows_sys::Win32::Foundation::POINT { x, y },
                 ];
-                Polyline(hdc, pts.as_ptr(), pts.len() as i32);
-                SelectObject(hdc, old_pen);
+                Polyline(mem_dc, pts.as_ptr(), pts.len() as i32);
+                SelectObject(mem_dc, old_pen);
                 DeleteObject(pen as _);
 
-                // Dimensions label.
                 let dim_text = format!("{}×{}", w, h);
                 let label = wide(&dim_text);
                 let font = CreateFontW(
-                    -14,
-                    0,
-                    0,
-                    0,
+                    -14, 0, 0, 0,
                     FW_NORMAL as i32,
-                    0,
-                    0,
-                    0,
+                    0, 0, 0,
                     DEFAULT_CHARSET as u32,
                     OUT_DEFAULT_PRECIS as u32,
                     CLIP_DEFAULT_PRECIS as u32,
@@ -328,17 +323,23 @@ unsafe fn paint(hwnd: HWND, st: &State) {
                     VARIABLE_PITCH as u32,
                     wide("Segoe UI").as_ptr(),
                 );
-                let old_font = SelectObject(hdc, font as _);
-                SetBkMode(hdc, TRANSPARENT as i32);
-                SetTextColor(hdc, 0x00FFFFFF);
+                let old_font = SelectObject(mem_dc, font as _);
+                SetBkMode(mem_dc, TRANSPARENT as i32);
+                SetTextColor(mem_dc, 0x00FFFFFF);
                 let label_x = (x + 4).max(0);
                 let label_y = if y + h + 4 < st.height { y + h + 4 } else { y - 18 };
-                TextOutW(hdc, label_x, label_y, label.as_ptr(), (label.len() - 1) as i32);
-                SelectObject(hdc, old_font);
+                TextOutW(mem_dc, label_x, label_y, label.as_ptr(), (label.len() - 1) as i32);
+                SelectObject(mem_dc, old_font);
                 DeleteObject(font as _);
             }
         }
 
+        // Single blit to the window — user only ever sees the composed frame.
+        BitBlt(hdc, 0, 0, st.width, st.height, mem_dc, 0, 0, SRCCOPY);
+
+        SelectObject(mem_dc, old_bmp);
+        DeleteObject(mem_bmp as _);
+        DeleteDC(mem_dc);
         EndPaint(hwnd, &ps);
     }
 }

@@ -25,7 +25,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE, GetSystemMetrics, SM_CXSCREEN,
     SM_CYSCREEN, SetForegroundWindow, BringWindowToTop, MoveWindow,
 };
-use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
+use windows_sys::Win32::Graphics::Gdi::{
+    BitBlt as GdiBitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
+    InvalidateRect, SRCCOPY as GDI_SRCCOPY, SelectObject, SetViewportOrgEx, UpdateWindow,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN, VK_Y, VK_Z, GetKeyState,
     SetCapture, ReleaseCapture,
@@ -180,14 +183,43 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
     let state = state.unwrap();
     unsafe {
         match msg {
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => {
+                // Suppress default erase; WM_PAINT paints the entire client area
+                // via a double-buffered memory DC.
+                1
+            }
             WM_PAINT => {
                 let mut ps: PAINTSTRUCT = core::mem::zeroed();
                 BeginPaint(hwnd, &mut ps);
-                // Draw toolbar via GDI.
-                paint_toolbar(hwnd, &state.borrow());
-                // Render canvas via D2D (full client minus toolbar).
                 let hdc = ps.hdc;
-                state.borrow().canvas.render(hwnd, hdc);
+
+                let mut client: windows_sys::Win32::Foundation::RECT = core::mem::zeroed();
+                GetClientRect(hwnd, &mut client);
+                let cw = client.right.max(1);
+                let ch = client.bottom.max(1);
+
+                // Double-buffer into a memory DC so the user only ever sees a
+                // single blit; intermediate fills/blits never reach the screen.
+                let mem_dc = CreateCompatibleDC(hdc);
+                let mem_bmp = CreateCompatibleBitmap(hdc, cw, ch);
+                let old_bmp = SelectObject(mem_dc, mem_bmp as _);
+
+                // Toolbar fills the top TOOLBAR_HEIGHT pixels of the memory DC.
+                paint_toolbar(mem_dc, cw, &state.borrow());
+
+                // Canvas paints below the toolbar. Shift the DC's viewport so
+                // the canvas's logical (0,0) lands at device (0, TOOLBAR_HEIGHT).
+                let mut prev_origin: windows_sys::Win32::Foundation::POINT = core::mem::zeroed();
+                SetViewportOrgEx(mem_dc, 0, TOOLBAR_HEIGHT, &mut prev_origin);
+                state.borrow().canvas.render(hwnd, mem_dc);
+                SetViewportOrgEx(mem_dc, prev_origin.x, prev_origin.y, core::ptr::null_mut());
+
+                // Single blit to screen — no flicker visible to the user.
+                GdiBitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, GDI_SRCCOPY);
+
+                SelectObject(mem_dc, old_bmp);
+                DeleteObject(mem_bmp as _);
+                DeleteDC(mem_dc);
                 EndPaint(hwnd, &ps);
                 0
             }
@@ -320,15 +352,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
     }
 }
 
-unsafe fn paint_toolbar(hwnd: HWND, st: &EditorState) {
+unsafe fn paint_toolbar(hdc: windows_sys::Win32::Graphics::Gdi::HDC, width: i32, st: &EditorState) {
     unsafe {
-        let hdc = windows_sys::Win32::Graphics::Gdi::GetDC(hwnd);
-        let mut rc: windows_sys::Win32::Foundation::RECT = core::mem::zeroed();
-        GetClientRect(hwnd, &mut rc);
         let toolbar_rc = windows_sys::Win32::Foundation::RECT {
             left: 0,
             top: 0,
-            right: rc.right,
+            right: width,
             bottom: TOOLBAR_HEIGHT,
         };
         let bg = CreateSolidBrush(0x00222426);
@@ -365,8 +394,6 @@ unsafe fn paint_toolbar(hwnd: HWND, st: &EditorState) {
             }
             x += SWATCH_SIZE + 6;
         }
-
-        windows_sys::Win32::Graphics::Gdi::ReleaseDC(hwnd, hdc);
     }
 }
 
