@@ -4,28 +4,34 @@ use crate::error::Result;
 use crate::gfx::bitmap::Bitmap;
 use crate::gfx::color::Color;
 
-/// Software-rasterised flatten path. Supports: arrows (Bresenham + arrowhead
-/// triangle), shapes (rectangle/ellipse outline + fill), step markers (filled
-/// circle), highlighter (alpha-blended rect), blur(solid) (opaque rect). Text
-/// glyph rasterization is currently a placeholder (text appears as a bordered
-/// rectangle on export — text content is preserved in `.frame` saves).
+/// Software-rasterised flatten path. Supports all annotation types including
+/// text glyphs (GDI-rendered), bezier curves (subdivided), and magnify scaled
+/// bitmap compositing.
 pub fn flatten(doc: &Document) -> Result<Bitmap> {
     let mut out = doc.base.clone();
+    let base = &doc.base;
     for ann in &doc.annotations {
-        rasterize(&mut out, ann);
+        rasterize(&mut out, base, ann);
     }
     Ok(out)
 }
 
-fn rasterize(bm: &mut Bitmap, ann: &Annotation) {
+fn rasterize(bm: &mut Bitmap, base: &Bitmap, ann: &Annotation) {
     match ann {
         Annotation::Arrow {
             start,
             end,
             color,
             stroke,
+            bezier,
             ..
-        } => raster_arrow(bm, *start, *end, *color, *stroke),
+        } => {
+            if let Some(b) = bezier {
+                raster_bezier_arrow(bm, *start, *end, *b, *color, *stroke);
+            } else {
+                raster_arrow(bm, *start, *end, *color, *stroke);
+            }
+        }
         Annotation::Shape {
             kind,
             bounds,
@@ -34,9 +40,16 @@ fn rasterize(bm: &mut Bitmap, ann: &Annotation) {
             stroke,
             ..
         } => raster_shape(bm, *kind, *bounds, *outline, *fill, *stroke),
-        Annotation::Text { bounds, color, .. } => {
-            // Placeholder rectangle outline (text glyph rasterization deferred to v2).
-            raster_rect_outline(bm, *bounds, *color, 1.0);
+        Annotation::Text {
+            bounds,
+            text,
+            color,
+            size,
+            ..
+        } => {
+            if !text.is_empty() {
+                raster_text_gdi(bm, *bounds, text, *color, *size);
+            }
         }
         Annotation::Step {
             center,
@@ -54,8 +67,6 @@ fn rasterize(bm: &mut Bitmap, ann: &Annotation) {
             BlurMode::Solid => raster_filled_rect(bm, *bounds, *fill),
             BlurMode::Blur => raster_box_blur(bm, *bounds, 12),
         },
-        // Magnify: CPU export shows only the outlines + connector. A proper
-        // scaled-bitmap path is a v2.1 polish.
         Annotation::Magnify {
             source,
             display,
@@ -63,17 +74,17 @@ fn rasterize(bm: &mut Bitmap, ann: &Annotation) {
             color,
             ..
         } => {
+            raster_magnify_bitmap(bm, base, *source, *display);
             raster_rect_outline(bm, *source, *color, *line_width);
             raster_rect_outline(bm, *display, *color, *line_width);
             raster_thick_line(
                 bm,
-                crate::editor::annotation::Point::new(source.x + source.w * 0.5, source.y + source.h * 0.5),
-                crate::editor::annotation::Point::new(display.x + display.w * 0.5, display.y + display.h * 0.5),
+                Point::new(source.x + source.w * 0.5, source.y + source.h * 0.5),
+                Point::new(display.x + display.w * 0.5, display.y + display.h * 0.5),
                 *color,
                 *line_width,
             );
         }
-        // Stamp: composite the bundled bitmap (alpha-blended) into the base.
         Annotation::Stamp { asset, bounds, .. } => {
             raster_stamp(bm, *asset, *bounds);
         }
@@ -344,4 +355,199 @@ fn raster_box_blur(bm: &mut Bitmap, bounds: Rect, radius: i32) {
         }
     }
     bm.bgra = src;
+}
+
+// ---- v2.1 flatten parity: text, bezier, magnify bitmap ----
+
+fn raster_text_gdi(bm: &mut Bitmap, bounds: Rect, text: &str, color: Color, font_size: f32) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+        DeleteDC, DeleteObject, DIB_RGB_COLORS, GetDIBits, GetDC, ReleaseDC,
+        SelectObject, SetBkMode, SetTextColor, TextOutW, TRANSPARENT,
+        CreateSolidBrush, FillRect,
+        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, FW_NORMAL, OUT_DEFAULT_PRECIS,
+        VARIABLE_PITCH,
+    };
+    unsafe {
+        // Compute integer pixel dimensions covering the text rect.
+        let rw = bounds.w.ceil() as i32;
+        let rh = bounds.h.ceil() as i32;
+        if rw <= 0 || rh <= 0 {
+            return;
+        }
+
+        let screen_dc = GetDC(0);
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        ReleaseDC(0, screen_dc);
+
+        // 32bpp top-down DIB.
+        let mut bi: BITMAPINFO = core::mem::zeroed();
+        bi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bi.bmiHeader.biWidth = rw;
+        bi.bmiHeader.biHeight = -rh;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB as u32;
+
+        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+        let dib = CreateDIBSection(mem_dc, &bi, DIB_RGB_COLORS, &mut bits, 0, 0);
+        if dib == 0 || bits.is_null() {
+            DeleteDC(mem_dc);
+            return;
+        }
+        let old = SelectObject(mem_dc, dib as _);
+
+        // Black fill.
+        SetBkMode(mem_dc, TRANSPARENT as i32);
+        let fill_brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(0x00000000);
+        let fill_r = windows_sys::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: rw,
+            bottom: rh,
+        };
+        windows_sys::Win32::Graphics::Gdi::FillRect(mem_dc, &fill_r, fill_brush);
+        windows_sys::Win32::Graphics::Gdi::DeleteObject(fill_brush as _);
+
+        // Create font and draw white text.
+        let face = crate::win::wide("Segoe UI");
+        let font = CreateFontW(
+            -(font_size as i32).max(8),
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            VARIABLE_PITCH as u32,
+            face.as_ptr(),
+        );
+        let old_font = SelectObject(mem_dc, font as _);
+        SetTextColor(mem_dc, 0x00FFFFFF);
+        let wtext = crate::win::wide(text);
+        TextOutW(mem_dc, 0, 0, wtext.as_ptr(), (wtext.len() - 1) as i32);
+
+        // Read back the intensity from R channel as alpha coverage.
+        let mut row_buf = vec![0u8; (rw * 4) as usize];
+        bi.bmiColors = [core::mem::zeroed()];
+        for y in 0..rh {
+            let _get = GetDIBits(
+                mem_dc,
+                dib,
+                y as u32,
+                1,
+                row_buf.as_mut_ptr() as *mut _,
+                &mut bi as *mut _,
+                DIB_RGB_COLORS,
+            );
+            // GDI renders top-down DIBs with row 0 at the top of the image.
+            let out_y = (bounds.y as i32) + y;
+            for x in 0..rw {
+                let pi = (x * 4) as usize;
+                let cov = row_buf[pi + 2] as u32; // R channel of white-on-black
+                if cov > 0 {
+                    let out_x = (bounds.x as i32) + x;
+                    let a = (color.a as u32 * cov / 255) as u8;
+                    let blended = Color { r: color.r, g: color.g, b: color.b, a };
+                    put_pixel(bm, out_x, out_y, blended);
+                }
+            }
+        }
+
+        SelectObject(mem_dc, old_font);
+        DeleteObject(font as _);
+        SelectObject(mem_dc, old);
+        DeleteObject(dib as _);
+        DeleteDC(mem_dc);
+    }
+}
+
+fn raster_bezier_arrow(
+    bm: &mut Bitmap,
+    start: Point,
+    end: Point,
+    cp: Point,
+    color: Color,
+    stroke: f32,
+) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let ux = dx / len;
+    let uy = dy / len;
+    let head_size = stroke * 4.0 + 6.0;
+    let shaft_end = Point::new(end.x - ux * head_size * 0.6, end.y - uy * head_size * 0.6);
+
+    // Subdivide quadratic bezier into N segments and draw thick lines.
+    let n = 20;
+    let mut prev = start;
+    for i in 1..=n {
+        let t = i as f32 / n as f32;
+        let tm = 1.0 - t;
+        let x = tm * tm * start.x + 2.0 * tm * t * cp.x + t * t * shaft_end.x;
+        let y = tm * tm * start.y + 2.0 * tm * t * cp.y + t * t * shaft_end.y;
+        let cur = Point::new(x, y);
+        raster_thick_line(bm, prev, cur, color, stroke);
+        prev = cur;
+    }
+
+    // Arrow head triangle.
+    let ortho_x = -uy;
+    let ortho_y = ux;
+    let p1 = end;
+    let p2 = Point::new(
+        end.x - ux * head_size + ortho_x * head_size * 0.5,
+        end.y - uy * head_size + ortho_y * head_size * 0.5,
+    );
+    let p3 = Point::new(
+        end.x - ux * head_size - ortho_x * head_size * 0.5,
+        end.y - uy * head_size - ortho_y * head_size * 0.5,
+    );
+    fill_triangle(bm, p1, p2, p3, color);
+}
+
+fn raster_magnify_bitmap(
+    bm: &mut Bitmap,
+    base: &Bitmap,
+    source: Rect,
+    display: Rect,
+) {
+    if source.w <= 0.0 || source.h <= 0.0 || display.w <= 0.0 || display.h <= 0.0 {
+        return;
+    }
+    let dw = display.w as i32;
+    let dh = display.h as i32;
+    let dx0 = display.x as i32;
+    let dy0 = display.y as i32;
+    let sw = source.w;
+    let sh = source.h;
+    let sx0 = source.x;
+    let sy0 = source.y;
+    let bw = base.width as f32;
+    let bh = base.height as f32;
+    for dy in 0..dh {
+        for dx in 0..dw {
+            // Nearest-neighbour sampling from source rect.
+            let u = sx0 + (dx as f32 + 0.5) / dw as f32 * sw;
+            let v = sy0 + (dy as f32 + 0.5) / dh as f32 * sh;
+            let ix = u as i32;
+            let iy = v as i32;
+            if ix < 0 || iy < 0 || ix as f32 >= bw || iy as f32 >= bh {
+                continue;
+            }
+            let src_idx = ((iy as u32 * base.width + ix as u32) * 4) as usize;
+            let c = Color {
+                b: base.bgra[src_idx],
+                g: base.bgra[src_idx + 1],
+                r: base.bgra[src_idx + 2],
+                a: base.bgra[src_idx + 3],
+            };
+            put_pixel(bm, dx0 + dx, dy0 + dy, c);
+        }
+    }
 }

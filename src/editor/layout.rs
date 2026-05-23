@@ -5,8 +5,7 @@
 use windows_sys::Win32::Foundation::RECT;
 
 pub const TOOLBAR_HEIGHT: i32 = 44;
-/// Property panel is added in Phase 5; for now reserve 0 width.
-pub const PROPERTY_WIDTH: i32 = 0;
+pub const PROPERTY_WIDTH: i32 = 200;
 
 pub fn toolbar_rect(client: &RECT) -> RECT {
     RECT {

@@ -25,6 +25,8 @@ pub struct ToolStyle {
     pub stroke: f32,
     pub font_size: f32,
     pub fill_alpha: u8, // 0 means transparent fill
+    pub blur_intensity: f32,
+    pub stamp_asset: u8,
 }
 
 impl Default for ToolStyle {
@@ -34,6 +36,8 @@ impl Default for ToolStyle {
             stroke: 4.0,
             font_size: 20.0,
             fill_alpha: 0,
+            blur_intensity: 12.0,
+            stamp_asset: 0,
         }
     }
 }
@@ -177,7 +181,7 @@ pub fn commit_drag(
                 id,
                 bounds,
                 mode: BlurMode::Blur,
-                intensity: 12.0,
+                intensity: style.blur_intensity,
                 fill: Color::BLACK,
             }
         }
@@ -226,8 +230,6 @@ pub fn commit_drag(
             }
         }
         Tool::Stamp => {
-            // Default: place a 48×48 stamp at the click. Asset = 0 (the first
-            // bundled icon); picker UI is v2.1.
             let size = if tiny { 48.0 } else { bounds.w.max(bounds.h).max(24.0) };
             let stamp_bounds = Rect {
                 x: drag.start.x - size * 0.5,
@@ -237,7 +239,7 @@ pub fn commit_drag(
             };
             Annotation::Stamp {
                 id,
-                asset: 0,
+                asset: style.stamp_asset,
                 bounds: stamp_bounds,
                 rotation: 0.0,
             }

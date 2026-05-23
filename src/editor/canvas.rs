@@ -10,6 +10,7 @@
 //! `D2DERR_RECREATE_TARGET` (device loss).
 
 use crate::editor::annotation::{Annotation, BlurMode, Document, Point, Rect, ShapeKind};
+use crate::editor::history::Command;
 use crate::editor::tools::{Drag, Tool, ToolStyle};
 use crate::error::{Error, Result};
 use crate::gfx::Gfx;
@@ -48,7 +49,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const CLASS_NAME: &str = "frame.editor.canvas";
 const HANDLE_HALF: f32 = 4.0;
+const BEZIER_HANDLE_RADIUS: f32 = 6.0;
 const BRUSH_CACHE: usize = 8;
+
+struct HandleDrag {
+    id: u32,
+    original_ann: Annotation,
+}
 
 pub struct Canvas {
     pub gfx: Rc<Gfx>,
@@ -61,6 +68,7 @@ pub struct Canvas {
     pub style: ToolStyle,
     pub drag: Option<Drag>,
     pub move_anchor: Option<Point>,
+    handle_drag: Option<HandleDrag>,
 
     // D2D resources. Created in `attach`; rebuilt on device loss.
     swap: Option<IDXGISwapChain1>,
@@ -85,6 +93,7 @@ impl Canvas {
             style: ToolStyle::default(),
             drag: None,
             move_anchor: None,
+            handle_drag: None,
             swap: None,
             target: None,
             base: None,
@@ -224,6 +233,10 @@ impl Canvas {
                 if let Some(i) = self.doc.find_index(sel) {
                     let bb = self.doc.annotations[i].bounding_box();
                     self.draw_handles(&ctx, bb)?;
+                    // Bezier control-point handle for selected bezier arrows.
+                    if let Annotation::Arrow { bezier: Some(cp), .. } = &self.doc.annotations[i] {
+                        self.draw_bezier_handle(&ctx, *cp)?;
+                    }
                 }
             }
 
@@ -731,7 +744,7 @@ impl Canvas {
             }
             Tool::BlurGaussian => {
                 let bounds = Rect::from_points(drag.start, drag.current);
-                self.draw_blur(ctx, bounds, 12.0)
+                self.draw_blur(ctx, bounds, self.style.blur_intensity)
             }
             Tool::BlurSolid => {
                 let bounds = Rect::from_points(drag.start, drag.current);
@@ -781,6 +794,34 @@ impl Canvas {
                 };
                 ctx.FillRectangle(&h, &brush);
             }
+        }
+        Ok(())
+    }
+
+    fn draw_bezier_handle(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        cp: Point,
+    ) -> Result<()> {
+        let brush: ID2D1Brush = self.brush(Color::rgb(0xFF, 0xC8, 0x3A))?.cast()?;
+        let r = BEZIER_HANDLE_RADIUS;
+        // Diamond shape.
+        let pts = [
+            Vector2 { X: cp.x, Y: cp.y - r },
+            Vector2 { X: cp.x + r, Y: cp.y },
+            Vector2 { X: cp.x, Y: cp.y + r },
+            Vector2 { X: cp.x - r, Y: cp.y },
+        ];
+        unsafe {
+            let geom = self.gfx.d2d.factory.CreatePathGeometry()?;
+            let sink = geom.Open()?;
+            sink.BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(pts[1]);
+            sink.AddLine(pts[2]);
+            sink.AddLine(pts[3]);
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+            ctx.FillGeometry(&geom, &brush, None);
         }
         Ok(())
     }
@@ -891,7 +932,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let y = ((l >> 16) & 0xFFFF) as i16 as i32;
                 let mut st = state.borrow_mut();
                 let p = st.canvas.screen_to_doc(x as f32, y as f32);
-                if st.canvas.active_tool == Tool::Move {
+
+                // Check for bezier CP handle hit on selected arrow.
+                let hit_cp = st.canvas.selected.and_then(|sel| {
+                    let idx = st.canvas.doc.find_index(sel)?;
+                    if let Annotation::Arrow { bezier: Some(cp), .. } = &st.canvas.doc.annotations[idx] {
+                        let dx = p.x - cp.x;
+                        let dy = p.y - cp.y;
+                        if dx * dx + dy * dy <= BEZIER_HANDLE_RADIUS * BEZIER_HANDLE_RADIUS {
+                            return Some(sel);
+                        }
+                    }
+                    None
+                });
+
+                if let Some(id) = hit_cp {
+                    if let Some(idx) = st.canvas.doc.find_index(id) {
+                        st.canvas.handle_drag = Some(HandleDrag {
+                            id,
+                            original_ann: st.canvas.doc.annotations[idx].clone(),
+                        });
+                    }
+                } else if st.canvas.active_tool == Tool::Move {
                     st.canvas.selected = st.canvas.doc.topmost_hit(p);
                     st.canvas.move_anchor = Some(p);
                 } else {
@@ -906,6 +968,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let y = ((l >> 16) & 0xFFFF) as i16 as i32;
                 let mut st = state.borrow_mut();
                 let p = st.canvas.screen_to_doc(x as f32, y as f32);
+
+                // Handle bezier CP drag.
+                if let Some(ref hd) = st.canvas.handle_drag {
+                    if let Some(idx) = st.canvas.doc.find_index(hd.id) {
+                        if let Annotation::Arrow { bezier: Some(ref mut cp), .. } = st.canvas.doc.annotations[idx] {
+                            *cp = p;
+                        }
+                    }
+                    drop(st);
+                    InvalidateRect(hwnd, core::ptr::null(), 0);
+                    return 0;
+                }
+
                 if let Some(drag) = st.canvas.drag.as_mut() {
                     drag.current = p;
                     drop(st);
@@ -931,6 +1006,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let mut text_spawn: Option<(u32, crate::editor::annotation::Rect, f32, f32, (f32, f32))> = None;
                 {
                     let mut st = state.borrow_mut();
+
+                    // Commit bezier CP drag.
+                    if let Some(hd) = st.canvas.handle_drag.take() {
+                        if let Some(idx) = st.canvas.doc.find_index(hd.id) {
+                            let after = st.canvas.doc.annotations[idx].clone();
+                            st.history.push(Command::Mutate {
+                                id: hd.id,
+                                before: hd.original_ann,
+                                after,
+                            });
+                        }
+                    }
+
                     if let Some(drag) = st.canvas.drag.take() {
                         let tool = st.canvas.active_tool;
                         let style = st.canvas.style;
@@ -1012,6 +1100,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let mut st = state.borrow_mut();
                 let mut invalidate = false;
                 if key == VK_ESCAPE as u32 {
+                    // Cancel bezier CP drag if active.
+                    if let Some(hd) = st.canvas.handle_drag.take() {
+                        if let Some(idx) = st.canvas.doc.find_index(hd.id) {
+                            st.canvas.doc.annotations[idx] = hd.original_ann;
+                        }
+                    }
                     st.canvas.selected = None;
                     invalidate = true;
                 } else if key == VK_DELETE as u32 || key == VK_BACK as u32 {

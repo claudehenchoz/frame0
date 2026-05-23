@@ -3,6 +3,7 @@ pub mod canvas;
 pub mod flatten;
 pub mod history;
 pub mod layout;
+pub mod property;
 pub mod stamps;
 pub mod text_edit;
 pub mod toolbar;

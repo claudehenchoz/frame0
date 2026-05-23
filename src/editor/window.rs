@@ -6,7 +6,7 @@ use crate::app::App;
 use crate::editor::annotation::Document;
 use crate::editor::canvas::Canvas;
 use crate::editor::history::{Command, History};
-use crate::editor::layout::{TOOLBAR_HEIGHT, canvas_rect, toolbar_rect};
+use crate::editor::layout::{TOOLBAR_HEIGHT, canvas_rect, property_rect, toolbar_rect};
 use crate::error::{Error, Result};
 use crate::gfx::bitmap::Bitmap;
 use crate::win::wide;
@@ -39,6 +39,7 @@ pub struct EditorState {
     pub current_path: Option<String>,
     pub canvas_hwnd: HWND,
     pub toolbar_hwnd: HWND,
+    pub property_hwnd: HWND,
 }
 
 thread_local! {
@@ -113,6 +114,7 @@ impl EditorWindow {
                 current_path: path,
                 canvas_hwnd: 0,
                 toolbar_hwnd: 0,
+                property_hwnd: 0,
             }));
             put_state(hwnd, state.clone());
 
@@ -122,9 +124,12 @@ impl EditorWindow {
                 crate::editor::toolbar::create_child(hwnd, toolbar_rect(&client))?;
             let cv_hwnd =
                 crate::editor::canvas::create_child(hwnd, canvas_rect(&client))?;
+            let pr_hwnd =
+                crate::editor::property::create_child(hwnd, property_rect(&client))?;
 
             put_state(tb_hwnd, state.clone());
             put_state(cv_hwnd, state.clone());
+            put_state(pr_hwnd, state.clone());
 
             // Hand the canvas's HWND to the Canvas itself so it can build its
             // swap chain.
@@ -133,6 +138,7 @@ impl EditorWindow {
                 let mut st = state.borrow_mut();
                 st.canvas_hwnd = cv_hwnd;
                 st.toolbar_hwnd = tb_hwnd;
+                st.property_hwnd = pr_hwnd;
                 st.canvas.attach(
                     cv_hwnd,
                     (cr.right - cr.left).max(1) as u32,
@@ -227,9 +233,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 GetClientRect(hwnd, &mut client);
                 let tb = toolbar_rect(&client);
                 let cv = canvas_rect(&client);
-                let (tb_hwnd, cv_hwnd) = {
+                let pr = property_rect(&client);
+                let (tb_hwnd, cv_hwnd, pr_hwnd) = {
                     let st = state.borrow();
-                    (st.toolbar_hwnd, st.canvas_hwnd)
+                    (st.toolbar_hwnd, st.canvas_hwnd, st.property_hwnd)
                 };
                 if tb_hwnd != 0 {
                     SetWindowPos(
@@ -253,6 +260,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                 }
+                if pr_hwnd != 0 {
+                    SetWindowPos(
+                        pr_hwnd,
+                        0,
+                        pr.left,
+                        pr.top,
+                        pr.right - pr.left,
+                        pr.bottom - pr.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
                 0
             }
             WM_COMMAND => {
@@ -264,15 +282,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 0
             }
             WM_DESTROY => {
-                let (tb, cv) = {
+                let (tb, cv, pr) = {
                     let st = state.borrow();
-                    (st.toolbar_hwnd, st.canvas_hwnd)
+                    (st.toolbar_hwnd, st.canvas_hwnd, st.property_hwnd)
                 };
                 if tb != 0 {
                     clear_state(tb);
                 }
                 if cv != 0 {
                     clear_state(cv);
+                }
+                if pr != 0 {
+                    clear_state(pr);
                 }
                 clear_state(hwnd);
                 if let Some(app) = state.borrow().app.upgrade() {
