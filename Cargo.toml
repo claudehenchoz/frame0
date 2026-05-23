@@ -48,6 +48,10 @@ features = [
   "Win32_Graphics_DirectWrite",
 ]
 
+# D2D point / matrix types live in windows-numerics in windows 0.61+.
+[dependencies.windows-numerics]
+version = "0.2"
+
 [profile.release]
 opt-level = "z"
 lto = "fat"

@@ -68,6 +68,9 @@ pub enum Annotation {
         end: Point,
         color: Color,
         stroke: f32,
+        /// Optional quadratic-bezier control point. `None` draws a straight
+        /// arrow; `Some(p)` draws a curved shaft via `p`.
+        bezier: Option<Point>,
     },
     Shape {
         id: AnnotationId,
@@ -105,6 +108,23 @@ pub enum Annotation {
         intensity: f32,
         fill: Color, // used when mode == Solid
     },
+    /// Magnifier: shows a scaled-up copy of `source` at `display`, with a
+    /// connecting line + rectangle outlines.
+    Magnify {
+        id: AnnotationId,
+        source: Rect,
+        display: Rect,
+        line_width: f32,
+        color: Color,
+    },
+    /// Stamp: a bundled or user PNG placed at `bounds`. `asset` indexes into
+    /// the bundled set (see `crate::editor::stamps::BUNDLED`).
+    Stamp {
+        id: AnnotationId,
+        asset: u8,
+        bounds: Rect,
+        rotation: f32,
+    },
 }
 
 impl Annotation {
@@ -115,7 +135,9 @@ impl Annotation {
             | Annotation::Text { id, .. }
             | Annotation::Step { id, .. }
             | Annotation::Highlighter { id, .. }
-            | Annotation::Blur { id, .. } => *id,
+            | Annotation::Blur { id, .. }
+            | Annotation::Magnify { id, .. }
+            | Annotation::Stamp { id, .. } => *id,
         }
     }
 
@@ -135,6 +157,15 @@ impl Annotation {
             },
             Annotation::Highlighter { bounds, .. } => *bounds,
             Annotation::Blur { bounds, .. } => *bounds,
+            // Magnify's bounding box covers both source + display + the line.
+            Annotation::Magnify { source, display, .. } => {
+                let l = source.x.min(display.x);
+                let t = source.y.min(display.y);
+                let r = (source.x + source.w).max(display.x + display.w);
+                let b = (source.y + source.h).max(display.y + display.h);
+                Rect { x: l, y: t, w: r - l, h: b - t }
+            }
+            Annotation::Stamp { bounds, .. } => *bounds,
         }
     }
 
@@ -144,22 +175,33 @@ impl Annotation {
 
     pub fn translate(&mut self, dx: f32, dy: f32) {
         match self {
-            Annotation::Arrow { start, end, .. } => {
+            Annotation::Arrow { start, end, bezier, .. } => {
                 start.x += dx;
                 start.y += dy;
                 end.x += dx;
                 end.y += dy;
+                if let Some(b) = bezier.as_mut() {
+                    b.x += dx;
+                    b.y += dy;
+                }
             }
             Annotation::Shape { bounds, .. }
             | Annotation::Text { bounds, .. }
             | Annotation::Highlighter { bounds, .. }
-            | Annotation::Blur { bounds, .. } => {
+            | Annotation::Blur { bounds, .. }
+            | Annotation::Stamp { bounds, .. } => {
                 bounds.x += dx;
                 bounds.y += dy;
             }
             Annotation::Step { center, .. } => {
                 center.x += dx;
                 center.y += dy;
+            }
+            Annotation::Magnify { source, display, .. } => {
+                source.x += dx;
+                source.y += dy;
+                display.x += dx;
+                display.y += dy;
             }
         }
     }

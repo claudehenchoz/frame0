@@ -1,8 +1,8 @@
 # frame
 
-A tiny Windows screenshot + annotation tool. Lives in the system tray, captures regions via a global hotkey, and opens a built-in editor with arrow / shape / text / step / highlighter / blur / redact tools.
+A tiny Windows screenshot + annotation tool. Lives in the system tray, captures regions via a global hotkey, and opens a built-in editor.
 
-Release binary is **~90 KB**, no installer, no runtime dependencies beyond what ships with Windows.
+Release binary is **~122 KB**, no installer, no runtime dependencies beyond what ships with Windows.
 
 ## Status
 
@@ -11,16 +11,22 @@ This is an MVP of the larger spec in `PROMPT.md`. What works:
 - System tray with right-click menu (Take / Edit / Repeat / Exit) and double-click capture.
 - Global hotkey for region capture (default `Ctrl+Win+PgDn`, configurable).
 - Multi-monitor region selection with live dimensions readout.
-- Editor with these tools: Move, Selection (rect), Arrow, Rectangle, Ellipse, Text, Step, Highlighter, Blur, Redact.
+- Background pre-warm thread loads D2D / DirectWrite / D3D11 / GDI+ DLLs and primes the system font cache so the first hotkey press is fast.
+- Editor with these tools: Move, Selection (rect), Arrow, Curve (Bezier arrow), Rectangle, Ellipse, Text (with in-place editing), Step, Highlighter, Blur (real Gaussian via Direct2D effect), Redact (opaque solid), Magnify (scaled inset from a source region), Stamp (4 bundled icons: ✓ ✗ ● ★).
+- Canvas renders via **Direct2D** with DirectWrite text — anti-aliased arrows, ellipses, smooth gaussian blur.
 - Six-color palette on the toolbar.
 - Undo / Redo with full history (`Ctrl+Z` / `Ctrl+Y`).
 - File menu: Save Project (`.frame`), Open Project, Export PNG, Export JPG, Copy to Clipboard.
 - Clipboard write produces `CF_DIB` + `CF_DIBV5` + `CF_PNG` so paste works in Paint, Word, browsers, Slack, etc.
 - INI-based config at `%APPDATA%\frame\frame.ini`.
 
-What's deferred (listed in the spec, not yet built): Callout, Magnify, Cut-out, Stamps, polygon/ellipse/freehand selection, Bezier arrows, scrolling capture, content-aware fill, presets UI, DXGI Desktop Duplication, window-pick UX with hover-highlight. Text annotations save and load but currently have no in-place editor — their content can only be set by editing a `.frame` file.
+Deferred (listed in the spec, still pending): Callout (rounded body + tails), Cut-out (band removal from the base image), polygon / ellipse / freehand selection shapes, the operations on a selection (delete / fill / invert / content-aware fill), scrolling capture, presets UI, DXGI Desktop Duplication, window-pick UX with hover-highlight, dedicated property panel for tool-specific options (stroke width / font size / blur intensity — defaults are usable but not yet editable from the UI).
 
-The editor canvas currently paints with GDI, so arrows and ellipses don't have anti-aliasing and the Blur tool draws an opaque dark rectangle rather than a real gaussian blur. The Direct2D / DirectWrite infrastructure is already linked in and ready for a future upgrade.
+Known editor / export caveats:
+- The canvas (on-screen) is D2D anti-aliased; **export and clipboard flatten via the CPU rasterizer**, which doesn't anti-alias and doesn't render text glyphs (text annotations show as outlined placeholder rectangles in exported PNG/JPG). Text content still round-trips through `.frame` save/load.
+- Bezier arrows look curved in the editor and in `.frame` round-trips, but the exported PNG renders them as straight lines.
+- Magnify's exported PNG shows only the outlines + connector line (not the scaled-up bitmap).
+- Bundled stamps (4 of them) are generated programmatically from vector geometry to keep the binary small.
 
 ## Install / build
 
@@ -55,6 +61,8 @@ In the editor:
 | Pick a tool | Click its button in the toolbar |
 | Pick a color | Click a swatch |
 | Draw | Click and drag on the canvas |
+| Edit text in place | Pick the Text tool, click — an EDIT box appears; type, press `Enter` to commit or `Esc` to cancel |
+| Re-edit text | Double-click an existing text annotation |
 | Select an existing annotation | Switch to Move tool, click |
 | Move selection | Drag with Move tool |
 | Delete selection | `Del` or `Backspace` |

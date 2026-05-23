@@ -1,41 +1,31 @@
+//! Editor parent window. Owns the menu, the layout of three children (toolbar,
+//! canvas, property panel), and the shared `EditorState`. Child windows look
+//! the state up via the thread-local map keyed by the parent's HWND.
+
 use crate::app::App;
-use crate::editor::annotation::{Document, Point};
+use crate::editor::annotation::Document;
 use crate::editor::canvas::Canvas;
 use crate::editor::history::{Command, History};
-use crate::editor::tools::{Drag, Tool, ToolStyle, commit_drag};
-use crate::editor::toolbar::{PALETTE, SWATCH_SIZE, TOOLBAR_HEIGHT, TOOLS, ToolEntry};
+use crate::editor::layout::{TOOLBAR_HEIGHT, canvas_rect, toolbar_rect};
 use crate::error::{Error, Result};
 use crate::gfx::bitmap::Bitmap;
-use crate::gfx::color::Color;
 use crate::win::wide;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HBRUSH, PAINTSTRUCT,
-    SetBkMode, SetTextColor, TRANSPARENT,
-};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, UpdateWindow};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CW_USEDEFAULT, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, GetClientRect, IDC_ARROW, LoadCursorW, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    PostMessageW, RegisterClassExW, SetMenu, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    SW_RESTORE, SW_SHOW, GWLP_USERDATA, GetWindowLongPtrW, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
-    WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE, GetSystemMetrics, SM_CXSCREEN,
-    SM_CYSCREEN, SetForegroundWindow, BringWindowToTop, MoveWindow,
-};
-use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt as GdiBitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
-    InvalidateRect, SRCCOPY as GDI_SRCCOPY, SelectObject, SetViewportOrgEx, UpdateWindow,
-};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_RETURN, VK_Y, VK_Z, GetKeyState,
-    SetCapture, ReleaseCapture,
+    AppendMenuW, BringWindowToTop, CW_USEDEFAULT, CreateMenu, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyWindow, GetClientRect, GetSystemMetrics, IDC_ARROW, LoadCursorW,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
+    SWP_NOZORDER, SetForegroundWindow, SetMenu, SetWindowPos, ShowWindow, SW_RESTORE, SW_SHOW,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
 
 const CLASS_NAME: &str = "frame.editor";
-const COLOR_BG: Color = Color::rgb(0x1A, 0x1B, 0x1D);
 
 pub struct EditorWindow {
     pub hwnd: HWND,
@@ -47,10 +37,33 @@ pub struct EditorState {
     pub canvas: Canvas,
     pub history: History,
     pub current_path: Option<String>,
+    pub canvas_hwnd: HWND,
+    pub toolbar_hwnd: HWND,
 }
 
 thread_local! {
-    static EDITOR_STATE_BY_HWND: RefCell<Option<(HWND, Rc<RefCell<EditorState>>)>> = const { RefCell::new(None) };
+    // Key = any window owned by the editor (parent or child). All entries point
+    // to the same Rc, so any wndproc can borrow shared state regardless of
+    // which window received the message. (HashMap::new isn't const, so this
+    // is the non-`const { }` flavour of thread_local.)
+    static EDITORS: RefCell<HashMap<HWND, Rc<RefCell<EditorState>>>> =
+        RefCell::new(HashMap::new());
+}
+
+pub fn get_state(hwnd: HWND) -> Option<Rc<RefCell<EditorState>>> {
+    EDITORS.with(|m| m.borrow().get(&hwnd).cloned())
+}
+
+fn put_state(hwnd: HWND, state: Rc<RefCell<EditorState>>) {
+    EDITORS.with(|m| {
+        m.borrow_mut().insert(hwnd, state);
+    });
+}
+
+fn clear_state(hwnd: HWND) {
+    EDITORS.with(|m| {
+        m.borrow_mut().remove(&hwnd);
+    });
 }
 
 impl EditorWindow {
@@ -98,17 +111,34 @@ impl EditorWindow {
                 canvas,
                 history: History::new(),
                 current_path: path,
+                canvas_hwnd: 0,
+                toolbar_hwnd: 0,
             }));
-            EDITOR_STATE_BY_HWND.with(|s| *s.borrow_mut() = Some((hwnd, state.clone())));
+            put_state(hwnd, state.clone());
 
-            // Attach D2D swap chain.
-            let mut client = core::mem::zeroed();
+            let mut client: RECT = core::mem::zeroed();
             GetClientRect(hwnd, &mut client);
-            state.borrow_mut().canvas.attach(
-                hwnd,
-                (client.right as u32).max(1),
-                ((client.bottom - TOOLBAR_HEIGHT) as u32).max(1),
-            )?;
+            let tb_hwnd =
+                crate::editor::toolbar::create_child(hwnd, toolbar_rect(&client))?;
+            let cv_hwnd =
+                crate::editor::canvas::create_child(hwnd, canvas_rect(&client))?;
+
+            put_state(tb_hwnd, state.clone());
+            put_state(cv_hwnd, state.clone());
+
+            // Hand the canvas's HWND to the Canvas itself so it can build its
+            // swap chain.
+            {
+                let cr = canvas_rect(&client);
+                let mut st = state.borrow_mut();
+                st.canvas_hwnd = cv_hwnd;
+                st.toolbar_hwnd = tb_hwnd;
+                st.canvas.attach(
+                    cv_hwnd,
+                    (cr.right - cr.left).max(1) as u32,
+                    (cr.bottom - cr.top).max(1) as u32,
+                )?;
+            }
 
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
@@ -128,27 +158,36 @@ impl EditorWindow {
 
     pub fn replace_image(&mut self, bmp: Bitmap) {
         let doc = Document::new(bmp);
-        if let Err(_) = self.state.borrow_mut().canvas.replace_document(doc) {
-            return;
-        }
+        let cv_hwnd = {
+            let mut st = self.state.borrow_mut();
+            if let Err(_) = st.canvas.replace_document(doc) {
+                return;
+            }
+            st.canvas_hwnd
+        };
         unsafe {
-            InvalidateRect(self.hwnd, core::ptr::null(), 0);
+            InvalidateRect(cv_hwnd, core::ptr::null(), 0);
         }
     }
 
     pub fn replace_document(&mut self, doc: Document) {
-        if let Err(_) = self.state.borrow_mut().canvas.replace_document(doc) {
-            return;
-        }
+        let cv_hwnd = {
+            let mut st = self.state.borrow_mut();
+            if let Err(_) = st.canvas.replace_document(doc) {
+                return;
+            }
+            st.canvas_hwnd
+        };
         unsafe {
-            InvalidateRect(self.hwnd, core::ptr::null(), 0);
+            InvalidateRect(cv_hwnd, core::ptr::null(), 0);
         }
     }
 }
 
 impl Drop for EditorWindow {
     fn drop(&mut self) {
-        EDITOR_STATE_BY_HWND.with(|s| *s.borrow_mut() = None);
+        // Cleanup handled by WM_DESTROY (which fires on the parent and clears
+        // entries for parent + children). Nothing to do here.
     }
 }
 
@@ -176,159 +215,43 @@ fn register_class() {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    let state = EDITOR_STATE_BY_HWND.with(|s| s.borrow().as_ref().and_then(|(h, st)| if *h == hwnd { Some(st.clone()) } else { None }));
-    if state.is_none() {
+    let state = get_state(hwnd);
+    let Some(state) = state else {
         return unsafe { DefWindowProcW(hwnd, msg, w, l) };
-    }
-    let state = state.unwrap();
+    };
     unsafe {
         match msg {
-            windows_sys::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => {
-                // Suppress default erase; WM_PAINT paints the entire client area
-                // via a double-buffered memory DC.
-                1
-            }
-            WM_PAINT => {
-                let mut ps: PAINTSTRUCT = core::mem::zeroed();
-                BeginPaint(hwnd, &mut ps);
-                let hdc = ps.hdc;
-
-                let mut client: windows_sys::Win32::Foundation::RECT = core::mem::zeroed();
-                GetClientRect(hwnd, &mut client);
-                let cw = client.right.max(1);
-                let ch = client.bottom.max(1);
-
-                // Double-buffer into a memory DC so the user only ever sees a
-                // single blit; intermediate fills/blits never reach the screen.
-                let mem_dc = CreateCompatibleDC(hdc);
-                let mem_bmp = CreateCompatibleBitmap(hdc, cw, ch);
-                let old_bmp = SelectObject(mem_dc, mem_bmp as _);
-
-                // Toolbar fills the top TOOLBAR_HEIGHT pixels of the memory DC.
-                paint_toolbar(mem_dc, cw, &state.borrow());
-
-                // Canvas paints below the toolbar. Shift the DC's viewport so
-                // the canvas's logical (0,0) lands at device (0, TOOLBAR_HEIGHT).
-                let mut prev_origin: windows_sys::Win32::Foundation::POINT = core::mem::zeroed();
-                SetViewportOrgEx(mem_dc, 0, TOOLBAR_HEIGHT, &mut prev_origin);
-                state.borrow().canvas.render(hwnd, mem_dc);
-                SetViewportOrgEx(mem_dc, prev_origin.x, prev_origin.y, core::ptr::null_mut());
-
-                // Single blit to screen — no flicker visible to the user.
-                GdiBitBlt(hdc, 0, 0, cw, ch, mem_dc, 0, 0, GDI_SRCCOPY);
-
-                SelectObject(mem_dc, old_bmp);
-                DeleteObject(mem_bmp as _);
-                DeleteDC(mem_dc);
-                EndPaint(hwnd, &ps);
-                0
-            }
+            WM_ERASEBKGND => 1,
             WM_SIZE => {
-                let cw = (l & 0xFFFF) as u16 as u32;
-                let ch = ((l >> 16) & 0xFFFF) as u16 as u32;
-                let _ = state
-                    .borrow_mut()
-                    .canvas
-                    .resize(cw.max(1), ch.saturating_sub(TOOLBAR_HEIGHT as u32).max(1));
-                InvalidateRect(hwnd, core::ptr::null(), 0);
-                0
-            }
-            WM_LBUTTONDOWN => {
-                let x = (l & 0xFFFF) as i16 as i32;
-                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
-                if y < TOOLBAR_HEIGHT {
-                    handle_toolbar_click(&state, x, y);
-                    InvalidateRect(hwnd, core::ptr::null(), 0);
-                    return 0;
+                let mut client: RECT = core::mem::zeroed();
+                GetClientRect(hwnd, &mut client);
+                let tb = toolbar_rect(&client);
+                let cv = canvas_rect(&client);
+                let (tb_hwnd, cv_hwnd) = {
+                    let st = state.borrow();
+                    (st.toolbar_hwnd, st.canvas_hwnd)
+                };
+                if tb_hwnd != 0 {
+                    SetWindowPos(
+                        tb_hwnd,
+                        0,
+                        tb.left,
+                        tb.top,
+                        tb.right - tb.left,
+                        tb.bottom - tb.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
                 }
-                SetCapture(hwnd);
-                let mut st = state.borrow_mut();
-                let p = st.canvas.screen_to_doc(x as f32, (y - TOOLBAR_HEIGHT) as f32);
-                if st.canvas.active_tool == Tool::Move {
-                    st.canvas.selected = st.canvas.doc.topmost_hit(p);
-                    st.canvas.move_anchor = Some(p);
-                } else {
-                    st.canvas.drag = Some(Drag { start: p, current: p });
-                }
-                drop(st);
-                InvalidateRect(hwnd, core::ptr::null(), 0);
-                0
-            }
-            WM_MOUSEMOVE => {
-                let x = (l & 0xFFFF) as i16 as i32;
-                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
-                let mut st = state.borrow_mut();
-                let p = st.canvas.screen_to_doc(x as f32, (y - TOOLBAR_HEIGHT) as f32);
-                if let Some(drag) = st.canvas.drag.as_mut() {
-                    drag.current = p;
-                    drop(st);
-                    InvalidateRect(hwnd, core::ptr::null(), 0);
-                    return 0;
-                }
-                if st.canvas.active_tool == Tool::Move {
-                    if let (Some(sel), Some(anchor)) = (st.canvas.selected, st.canvas.move_anchor) {
-                        if let Some(i) = st.canvas.doc.find_index(sel) {
-                            let dx = p.x - anchor.x;
-                            let dy = p.y - anchor.y;
-                            st.canvas.doc.annotations[i].translate(dx, dy);
-                            st.canvas.move_anchor = Some(p);
-                            drop(st);
-                            InvalidateRect(hwnd, core::ptr::null(), 0);
-                        }
-                    }
-                }
-                0
-            }
-            WM_LBUTTONUP => {
-                ReleaseCapture();
-                let mut st = state.borrow_mut();
-                if let Some(drag) = st.canvas.drag.take() {
-                    let tool = st.canvas.active_tool;
-                    let style = st.canvas.style;
-                    if let Some(cmd) = commit_drag(tool, style, drag, &mut st.canvas.doc) {
-                        st.history.push(cmd);
-                    }
-                }
-                st.canvas.move_anchor = None;
-                drop(st);
-                InvalidateRect(hwnd, core::ptr::null(), 0);
-                0
-            }
-            WM_KEYDOWN => {
-                let ctrl = (GetKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
-                let mut st = state.borrow_mut();
-                match w as u32 {
-                    v if v == VK_ESCAPE as u32 => {
-                        st.canvas.selected = None;
-                        drop(st);
-                        InvalidateRect(hwnd, core::ptr::null(), 0);
-                    }
-                    v if v == VK_DELETE as u32 || v == VK_BACK as u32 => {
-                        if let Some(sel) = st.canvas.selected {
-                            if let Some(idx) = st.canvas.doc.find_index(sel) {
-                                let ann = st.canvas.doc.annotations.remove(idx);
-                                st.history.push(Command::Remove { index: idx, ann });
-                                st.canvas.selected = None;
-                            }
-                        }
-                        drop(st);
-                        InvalidateRect(hwnd, core::ptr::null(), 0);
-                    }
-                    v if ctrl && v == VK_Z as u32 => {
-                        let s = &mut *st;
-                        let (doc, history) = (&mut s.canvas.doc, &mut s.history);
-                        history.undo(doc);
-                        drop(st);
-                        InvalidateRect(hwnd, core::ptr::null(), 0);
-                    }
-                    v if ctrl && v == VK_Y as u32 => {
-                        let s = &mut *st;
-                        let (doc, history) = (&mut s.canvas.doc, &mut s.history);
-                        history.redo(doc);
-                        drop(st);
-                        InvalidateRect(hwnd, core::ptr::null(), 0);
-                    }
-                    _ => {}
+                if cv_hwnd != 0 {
+                    SetWindowPos(
+                        cv_hwnd,
+                        0,
+                        cv.left,
+                        cv.top,
+                        cv.right - cv.left,
+                        cv.bottom - cv.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
                 }
                 0
             }
@@ -341,84 +264,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 0
             }
             WM_DESTROY => {
+                let (tb, cv) = {
+                    let st = state.borrow();
+                    (st.toolbar_hwnd, st.canvas_hwnd)
+                };
+                if tb != 0 {
+                    clear_state(tb);
+                }
+                if cv != 0 {
+                    clear_state(cv);
+                }
+                clear_state(hwnd);
                 if let Some(app) = state.borrow().app.upgrade() {
                     app.editor_closed();
                 }
-                EDITOR_STATE_BY_HWND.with(|s| *s.borrow_mut() = None);
                 0
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
         }
-    }
-}
-
-unsafe fn paint_toolbar(hdc: windows_sys::Win32::Graphics::Gdi::HDC, width: i32, st: &EditorState) {
-    unsafe {
-        let toolbar_rc = windows_sys::Win32::Foundation::RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: TOOLBAR_HEIGHT,
-        };
-        let bg = CreateSolidBrush(0x00222426);
-        FillRect(hdc, &toolbar_rc, bg);
-        DeleteObject(bg as _);
-
-        let mut x = 8;
-        for entry in TOOLS {
-            draw_tool_button(hdc, x, 8, entry, st.canvas.active_tool == entry.tool);
-            x += 64;
-        }
-        x += 12;
-        for c in PALETTE {
-            let r = windows_sys::Win32::Foundation::RECT {
-                left: x,
-                top: (TOOLBAR_HEIGHT - SWATCH_SIZE) / 2,
-                right: x + SWATCH_SIZE,
-                bottom: (TOOLBAR_HEIGHT - SWATCH_SIZE) / 2 + SWATCH_SIZE,
-            };
-            let bgr = ((c.b as u32) | ((c.g as u32) << 8) | ((c.r as u32) << 16)) as u32;
-            let br = CreateSolidBrush(bgr);
-            FillRect(hdc, &r, br);
-            DeleteObject(br as _);
-            if *c == st.canvas.style.color {
-                let outline = CreateSolidBrush(0x00FFFFFF);
-                let or = windows_sys::Win32::Foundation::RECT {
-                    left: r.left - 2,
-                    top: r.top - 2,
-                    right: r.right + 2,
-                    bottom: r.top - 1,
-                };
-                FillRect(hdc, &or, outline);
-                DeleteObject(outline as _);
-            }
-            x += SWATCH_SIZE + 6;
-        }
-    }
-}
-
-unsafe fn draw_tool_button(
-    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
-    x: i32,
-    y: i32,
-    entry: &ToolEntry,
-    active: bool,
-) {
-    unsafe {
-        let r = windows_sys::Win32::Foundation::RECT {
-            left: x,
-            top: y,
-            right: x + 60,
-            bottom: y + TOOLBAR_HEIGHT - 16,
-        };
-        let color = if active { 0x00505964 } else { 0x002E3236 };
-        let bg = CreateSolidBrush(color);
-        FillRect(hdc, &r, bg);
-        DeleteObject(bg as _);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, 0x00E0E0E0);
-        let label = wide(entry.label);
-        windows_sys::Win32::Graphics::Gdi::TextOutW(hdc, x + 8, y + 4, label.as_ptr(), (label.len() - 1) as i32);
     }
 }
 
@@ -479,11 +342,15 @@ fn handle_command(hwnd: HWND, state: &Rc<RefCell<EditorState>>, cmd: u16) {
             .flatten();
             if let Some(p) = path {
                 if let Ok(doc) = crate::io::project::load(&p) {
-                    if let Err(_) = state.borrow_mut().canvas.replace_document(doc) {
-                        return;
-                    }
+                    let cv = {
+                        let mut st = state.borrow_mut();
+                        if st.canvas.replace_document(doc).is_err() {
+                            return;
+                        }
+                        st.canvas_hwnd
+                    };
                     unsafe {
-                        InvalidateRect(hwnd, core::ptr::null(), 0);
+                        InvalidateRect(cv, core::ptr::null(), 0);
                     }
                 }
             }
@@ -525,30 +392,4 @@ fn handle_command(hwnd: HWND, state: &Rc<RefCell<EditorState>>, cmd: u16) {
         },
         _ => {}
     }
-}
-
-fn handle_toolbar_click(state: &Rc<RefCell<EditorState>>, x: i32, _y: i32) {
-    let mut st = state.borrow_mut();
-    let mut cx = 8;
-    for entry in TOOLS {
-        if x >= cx && x < cx + 60 {
-            st.canvas.active_tool = entry.tool;
-            return;
-        }
-        cx += 64;
-    }
-    cx += 12;
-    for c in PALETTE {
-        if x >= cx && x < cx + SWATCH_SIZE {
-            st.canvas.style.color = *c;
-            return;
-        }
-        cx += SWATCH_SIZE + 6;
-    }
-}
-
-#[allow(dead_code)]
-fn _silence_unused() {
-    let _ = (Point::new(0.0, 0.0), VK_RETURN, SetWindowLongPtrW, SetWindowTextW, GetWindowLongPtrW, GWLP_USERDATA, PostMessageW, MoveWindow, ToolStyle::default());
-    let _: HBRUSH = 0;
 }

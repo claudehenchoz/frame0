@@ -1,26 +1,58 @@
+//! D2D-rendered canvas child window.
+//!
+//! The canvas owns its DXGI swap chain and renders entirely with Direct2D 1.1
+//! through `ID2D1DeviceContext`. The device context is shared from
+//! `crate::gfx::d2d::D2D` (one per process, single-threaded apartment).
+//!
+//! Per-frame: `BeginDraw` → clear → `SetTransform` (scale + translate) →
+//! `DrawBitmap(base)` → walk annotations → preview drag → handles → `EndDraw` →
+//! `Present(1, 0)`. `EndDraw` is wrapped with a one-shot retry on
+//! `D2DERR_RECREATE_TARGET` (device loss).
+
 use crate::editor::annotation::{Annotation, BlurMode, Document, Point, Rect, ShapeKind};
 use crate::editor::tools::{Drag, Tool, ToolStyle};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::gfx::Gfx;
 use crate::gfx::bitmap::Bitmap;
 use crate::gfx::color::Color;
-use crate::win::wide;
+use crate::gfx::d2d::{color_f, upload_bitmap};
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::{HWND, RECT};
-use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC, DeleteObject, Ellipse, FW_NORMAL, FillRect,
-    FrameRect, GetStockObject, HALFTONE, HBITMAP, HBRUSH, HDC, LineTo, MoveToEx, NULL_BRUSH,
-    OUT_DEFAULT_PRECIS, PS_SOLID, Polygon, Rectangle, SRCCOPY, SelectObject, SetBkMode,
-    SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT, TextOutW, VARIABLE_PITCH,
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND as WinHWND};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_END_CLOSED, D2D_RECT_F,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::Graphics::Direct2D::{
+    CLSID_D2D1GaussianBlur, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_PRIMITIVE_BLEND, D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
+    D2D1_PROPERTY_TYPE_FLOAT, ID2D1Bitmap1, ID2D1Brush, ID2D1Effect, ID2D1Image,
+    ID2D1SolidColorBrush,
+};
+use windows_numerics::{Matrix3x2, Vector2};
+use windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL;
+use windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
+use windows::core::Interface;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE,
+    VK_Y, VK_Z,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, RegisterClassExW,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SIZE,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_VISIBLE,
+};
+
+const CLASS_NAME: &str = "frame.editor.canvas";
+const HANDLE_HALF: f32 = 4.0;
+const BRUSH_CACHE: usize = 8;
 
 pub struct Canvas {
     pub gfx: Rc<Gfx>,
     pub doc: Document,
-    pub base_dib: Option<HBITMAP>,
     pub selected: Option<u32>,
     pub view_scale: f32,
     pub view_offset: (f32, f32),
@@ -29,420 +61,728 @@ pub struct Canvas {
     pub style: ToolStyle,
     pub drag: Option<Drag>,
     pub move_anchor: Option<Point>,
+
+    // D2D resources. Created in `attach`; rebuilt on device loss.
+    swap: Option<IDXGISwapChain1>,
+    target: Option<ID2D1Bitmap1>,
+    base: Option<ID2D1Bitmap1>,
+    brushes: Vec<(Color, ID2D1SolidColorBrush)>,
+    gaussian: Option<ID2D1Effect>,
+    /// Bundled-stamp bitmaps, lazily decoded on first draw.
+    stamps: Vec<Option<ID2D1Bitmap1>>,
 }
 
 impl Canvas {
     pub fn create(gfx: Rc<Gfx>, doc: Document) -> Result<Self> {
-        let mut s = Self {
+        Ok(Self {
             gfx,
             doc,
-            base_dib: None,
             selected: None,
             view_scale: 1.0,
-            view_offset: (40.0, 8.0),
+            view_offset: (24.0, 12.0),
             size: (1024, 768),
             active_tool: Tool::Arrow,
             style: ToolStyle::default(),
             drag: None,
             move_anchor: None,
-        };
-        s.upload_base();
-        Ok(s)
+            swap: None,
+            target: None,
+            base: None,
+            brushes: Vec::new(),
+            gaussian: None,
+            stamps: vec![None; crate::editor::stamps::COUNT],
+        })
     }
 
-    pub fn attach(&mut self, _hwnd: HWND, w: u32, h: u32) -> Result<()> {
+    /// Attach to the canvas child HWND. Creates the swap chain and renders
+    /// the base image into a D2D bitmap.
+    pub fn attach(&mut self, hwnd: HWND, w: u32, h: u32) -> Result<()> {
         self.size = (w.max(1), h.max(1));
+        let (swap, target) = self
+            .gfx
+            .d2d
+            .create_swapchain_target(WinHWND(hwnd as *mut _), self.size.0, self.size.1)?;
+        self.swap = Some(swap);
+        self.target = Some(target);
+        self.upload_base()?;
         Ok(())
     }
 
     pub fn resize(&mut self, w: u32, h: u32) -> Result<()> {
-        self.size = (w.max(1), h.max(1));
+        let new = (w.max(1), h.max(1));
+        if new == self.size {
+            return Ok(());
+        }
+        self.size = new;
+        let Some(swap) = self.swap.as_ref() else { return Ok(()) };
+        unsafe {
+            // Must drop the bound target bitmap before ResizeBuffers.
+            self.target = None;
+            self.gfx.d2d.context.SetTarget(None);
+            swap.ResizeBuffers(
+                0,
+                new.0,
+                new.1,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+                windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0),
+            )?;
+            self.target = Some(self.gfx.d2d.target_bitmap_for_swap(swap)?);
+        }
         Ok(())
     }
 
     pub fn replace_document(&mut self, doc: Document) -> Result<()> {
-        self.cleanup_dib();
         self.doc = doc;
         self.selected = None;
-        self.upload_base();
+        self.upload_base()
+    }
+
+    fn upload_base(&mut self) -> Result<()> {
+        let bm = upload_bitmap(&self.gfx.d2d.context, &self.doc.base)?;
+        self.base = Some(bm);
         Ok(())
     }
 
-    fn cleanup_dib(&mut self) {
-        if let Some(dib) = self.base_dib.take() {
-            unsafe {
-                DeleteObject(dib as _);
+    /// Render one frame. On device loss (`D2DERR_RECREATE_TARGET`) the canvas
+    /// drops its device-bound resources and skips this frame; the next
+    /// `attach` (called by the canvas wndproc when it sees `swap.is_none()`)
+    /// rebuilds them. A perfect recovery would re-attach in-place; that's a
+    /// v2.1 task.
+    pub fn render(&mut self) -> Result<()> {
+        if self.target.is_none() || self.swap.is_none() {
+            return Ok(());
+        }
+        match self.render_inner() {
+            Ok(()) => Ok(()),
+            Err(Error::Hr(h)) if h == D2DERR_RECREATE_TARGET.0 => {
+                self.swap = None;
+                self.target = None;
+                self.base = None;
+                self.brushes.clear();
+                self.gaussian = None;
+                for s in &mut self.stamps {
+                    *s = None;
+                }
+                Ok(())
             }
+            Err(e) => Err(e),
         }
     }
 
-    fn upload_base(&mut self) {
-        let bm = &self.doc.base;
+    fn render_inner(&mut self) -> Result<()> {
+        let ctx = self.gfx.d2d.context.clone();
+        let target = self.target.as_ref().ok_or(Error::msg("no D2D target"))?;
         unsafe {
-            let mut bi: BITMAPINFO = core::mem::zeroed();
-            bi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            bi.bmiHeader.biWidth = bm.width as i32;
-            bi.bmiHeader.biHeight = -(bm.height as i32);
-            bi.bmiHeader.biPlanes = 1;
-            bi.bmiHeader.biBitCount = 32;
-            bi.bmiHeader.biCompression = BI_RGB as u32;
-            let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-            let dib = CreateDIBSection(
-                0,
-                &bi,
-                DIB_RGB_COLORS,
-                &mut bits,
-                0,
-                0,
-            );
-            if dib != 0 && !bits.is_null() {
-                core::ptr::copy_nonoverlapping(bm.bgra.as_ptr(), bits as *mut u8, bm.bgra.len());
-                self.base_dib = Some(dib);
-            }
-        }
-    }
+            let target_img: ID2D1Image = target.cast()?;
+            ctx.SetTarget(Some(&target_img));
+            ctx.BeginDraw();
+            ctx.Clear(Some(&color_f(Color::rgb(0x1A, 0x1B, 0x1D))));
 
-    /// Render the canvas into `hdc`. The canvas paints its own background in
-    /// logical (0,0) .. (self.size.0, self.size.1); the caller is responsible
-    /// for positioning via `SetViewportOrgEx` if the canvas is offset within
-    /// its host window (e.g. below a toolbar).
-    pub fn render(&self, _hwnd: HWND, hdc: HDC) {
-        unsafe {
-            let rc = RECT {
-                left: 0,
-                top: 0,
-                right: self.size.0 as i32,
-                bottom: self.size.1 as i32,
+            // Document-space transform.
+            let m = Matrix3x2 {
+                M11: self.view_scale,
+                M12: 0.0,
+                M21: 0.0,
+                M22: self.view_scale,
+                M31: self.view_offset.0,
+                M32: self.view_offset.1,
             };
+            ctx.SetTransform(&m);
 
-            let bg = CreateSolidBrush(rgb_to_colorref(Color::rgb(0x1A, 0x1B, 0x1D)));
-            FillRect(hdc, &rc, bg);
-            DeleteObject(bg as _);
-
-            if let Some(dib) = self.base_dib {
-                let mem_dc = CreateCompatibleDC(hdc);
-                let old = SelectObject(mem_dc, dib as _);
-                SetStretchBltMode(hdc, HALFTONE as i32);
-                let dx = self.view_offset.0 as i32;
-                let dy = self.view_offset.1 as i32;
-                let dw = (self.doc.base.width as f32 * self.view_scale) as i32;
-                let dh = (self.doc.base.height as f32 * self.view_scale) as i32;
-                StretchBlt(
-                    hdc,
-                    dx,
-                    dy,
-                    dw,
-                    dh,
-                    mem_dc,
-                    0,
-                    0,
-                    self.doc.base.width as i32,
-                    self.doc.base.height as i32,
-                    SRCCOPY,
+            // Base image.
+            if let Some(base) = &self.base {
+                let dest = D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: self.doc.base.width as f32,
+                    bottom: self.doc.base.height as f32,
+                };
+                let base_bm: windows::Win32::Graphics::Direct2D::ID2D1Bitmap = base.cast()?;
+                ctx.DrawBitmap(
+                    &base_bm,
+                    Some(&dest),
+                    1.0,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    None,
+                    None,
                 );
-                SelectObject(mem_dc, old);
-                DeleteDC(mem_dc);
             }
 
-            for ann in &self.doc.annotations {
-                self.draw_annotation(hdc, ann);
+            // Annotations.
+            let annotations = self.doc.annotations.clone();
+            for ann in &annotations {
+                self.draw_annotation(&ctx, ann)?;
             }
+
+            // Preview drag.
             if let Some(drag) = self.drag {
-                self.draw_preview(hdc, drag);
+                self.draw_preview(&ctx, drag)?;
             }
+
+            // Selection handles.
             if let Some(sel) = self.selected {
                 if let Some(i) = self.doc.find_index(sel) {
                     let bb = self.doc.annotations[i].bounding_box();
-                    self.draw_handles(hdc, bb);
+                    self.draw_handles(&ctx, bb)?;
                 }
+            }
+
+            // Reset transform; EndDraw.
+            let identity = Matrix3x2 {
+                M11: 1.0,
+                M12: 0.0,
+                M21: 0.0,
+                M22: 1.0,
+                M31: 0.0,
+                M32: 0.0,
+            };
+            ctx.SetTransform(&identity);
+
+            let mut tag1 = 0u64;
+            let mut tag2 = 0u64;
+            ctx.EndDraw(Some(&mut tag1), Some(&mut tag2))?;
+            ctx.SetTarget(None);
+        }
+        if let Some(swap) = &self.swap {
+            self.gfx.d2d.present(swap);
+        }
+        Ok(())
+    }
+
+    fn brush(&mut self, color: Color) -> Result<ID2D1SolidColorBrush> {
+        if let Some(idx) = self.brushes.iter().position(|(c, _)| *c == color) {
+            return Ok(self.brushes[idx].1.clone());
+        }
+        let cf = color_f(color);
+        let brush = unsafe { self.gfx.d2d.context.CreateSolidColorBrush(&cf, None)? };
+        if self.brushes.len() >= BRUSH_CACHE {
+            self.brushes.remove(0);
+        }
+        self.brushes.push((color, brush.clone()));
+        Ok(brush)
+    }
+
+    fn draw_annotation(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        ann: &Annotation,
+    ) -> Result<()> {
+        match ann {
+            Annotation::Arrow { start, end, color, stroke, bezier, .. } => {
+                self.draw_arrow(ctx, *start, *end, *color, *stroke, *bezier)
+            }
+            Annotation::Shape { kind, bounds, outline, fill, stroke, .. } => {
+                self.draw_shape(ctx, *kind, *bounds, *outline, *fill, *stroke)
+            }
+            Annotation::Text { bounds, text, color, size, .. } => {
+                self.draw_text(ctx, *bounds, text, *color, *size)
+            }
+            Annotation::Step { center, radius, value, fill, text, .. } => {
+                self.draw_step(ctx, *center, *radius, value, *fill, *text)
+            }
+            Annotation::Highlighter { bounds, color, .. } => {
+                self.draw_highlight(ctx, *bounds, *color)
+            }
+            Annotation::Blur { bounds, mode, fill, intensity, .. } => match mode {
+                BlurMode::Solid => self.draw_solid(ctx, *bounds, *fill),
+                BlurMode::Blur => self.draw_blur(ctx, *bounds, *intensity),
+            },
+            Annotation::Magnify { source, display, line_width, color, .. } => {
+                self.draw_magnify(ctx, *source, *display, *line_width, *color)
+            }
+            Annotation::Stamp { asset, bounds, .. } => {
+                self.draw_stamp(ctx, *asset, *bounds)
             }
         }
     }
 
-    unsafe fn draw_annotation(&self, hdc: HDC, ann: &Annotation) {
+    fn draw_arrow(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        start: Point,
+        end: Point,
+        color: Color,
+        stroke: f32,
+        bezier: Option<Point>,
+    ) -> Result<()> {
+        let brush = self.brush(color)?;
+        let brush_iface: ID2D1Brush = brush.cast()?;
+
+        // Direction at the head end — used to size and orient the arrow head.
+        // For straight arrows this is start→end; for bezier arrows we use the
+        // tangent at t=1, which is `2 * (end - control)` for a quadratic.
+        let (tdx, tdy) = if let Some(b) = bezier {
+            (end.x - b.x, end.y - b.y)
+        } else {
+            (end.x - start.x, end.y - start.y)
+        };
+        let tlen = (tdx * tdx + tdy * tdy).sqrt().max(1.0);
+        let ux = tdx / tlen;
+        let uy = tdy / tlen;
+        let head = stroke * 4.0 + 6.0;
+        let shaft_ex = end.x - ux * head * 0.6;
+        let shaft_ey = end.y - uy * head * 0.6;
+
         unsafe {
-            match ann {
-                Annotation::Arrow { start, end, color, stroke, .. } => {
-                    self.draw_arrow(hdc, *start, *end, *color, *stroke);
-                }
-                Annotation::Shape { kind, bounds, outline, fill, stroke, .. } => {
-                    self.draw_shape(hdc, *kind, *bounds, *outline, *fill, *stroke);
-                }
-                Annotation::Text { bounds, text, color, size, .. } => {
-                    self.draw_text(hdc, *bounds, text, *color, *size);
-                }
-                Annotation::Step { center, radius, value, fill, text, .. } => {
-                    self.draw_step(hdc, *center, *radius, value, *fill, *text);
-                }
-                Annotation::Highlighter { bounds, color, .. } => {
-                    self.draw_highlight(hdc, *bounds, *color);
-                }
-                Annotation::Blur { bounds, mode, fill, .. } => {
-                    let c = match mode {
-                        BlurMode::Solid => *fill,
-                        BlurMode::Blur => Color::rgba(40, 40, 40, 255),
-                    };
-                    self.draw_filled_rect(hdc, *bounds, c);
-                }
+            if let Some(b) = bezier {
+                // Quadratic-bezier shaft via path geometry.
+                let geom = self.gfx.d2d.factory.CreatePathGeometry()?;
+                let sink = geom.Open()?;
+                sink.BeginFigure(
+                    Vector2 { X: start.x, Y: start.y },
+                    windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_HOLLOW,
+                );
+                let segs = [windows::Win32::Graphics::Direct2D::D2D1_QUADRATIC_BEZIER_SEGMENT {
+                    point1: Vector2 { X: b.x, Y: b.y },
+                    point2: Vector2 { X: shaft_ex, Y: shaft_ey },
+                }];
+                sink.AddQuadraticBeziers(&segs);
+                sink.EndFigure(
+                    windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_OPEN,
+                );
+                sink.Close()?;
+                ctx.DrawGeometry(&geom, &brush_iface, stroke, None);
+            } else {
+                ctx.DrawLine(
+                    Vector2 { X: start.x, Y: start.y },
+                    Vector2 { X: shaft_ex, Y: shaft_ey },
+                    &brush_iface,
+                    stroke,
+                    None,
+                );
             }
         }
-    }
 
-    fn to_screen(&self, p: Point) -> (i32, i32) {
-        (
-            (self.view_offset.0 + p.x * self.view_scale) as i32,
-            (self.view_offset.1 + p.y * self.view_scale) as i32,
-        )
-    }
+        // Head triangle as filled path geometry.
+        let ortho_x = -uy;
+        let ortho_y = ux;
+        let p1 = Vector2 { X: end.x, Y: end.y };
+        let p2 = Vector2 {
+            X: end.x - ux * head + ortho_x * head * 0.5,
+            Y: end.y - uy * head + ortho_y * head * 0.5,
+        };
+        let p3 = Vector2 {
+            X: end.x - ux * head - ortho_x * head * 0.5,
+            Y: end.y - uy * head - ortho_y * head * 0.5,
+        };
 
-    fn to_screen_rect(&self, r: Rect) -> RECT {
-        let (x, y) = self.to_screen(Point::new(r.x, r.y));
-        let (x2, y2) = self.to_screen(Point::new(r.x + r.w, r.y + r.h));
-        RECT { left: x, top: y, right: x2, bottom: y2 }
-    }
-
-    unsafe fn draw_arrow(&self, hdc: HDC, start: Point, end: Point, color: Color, stroke: f32) {
+        let geom = unsafe { self.gfx.d2d.factory.CreatePathGeometry()? };
         unsafe {
-            let (sx, sy) = self.to_screen(start);
-            let (ex, ey) = self.to_screen(end);
-            let pen_w = ((stroke * self.view_scale) as i32).max(1);
-            let pen = CreatePen(PS_SOLID as i32, pen_w, rgb_to_colorref(color));
-            let old_pen = SelectObject(hdc, pen as _);
-            let dx = (ex - sx) as f32;
-            let dy = (ey - sy) as f32;
-            let len = (dx * dx + dy * dy).sqrt().max(1.0);
-            let ux = dx / len;
-            let uy = dy / len;
-            let head = (stroke * 4.0 + 6.0) * self.view_scale;
-            let shaft_ex = (ex as f32 - ux * head * 0.6) as i32;
-            let shaft_ey = (ey as f32 - uy * head * 0.6) as i32;
-            MoveToEx(hdc, sx, sy, core::ptr::null_mut());
-            LineTo(hdc, shaft_ex, shaft_ey);
-
-            let ortho_x = -uy;
-            let ortho_y = ux;
-            let p2x = (ex as f32 - ux * head + ortho_x * head * 0.5) as i32;
-            let p2y = (ey as f32 - uy * head + ortho_y * head * 0.5) as i32;
-            let p3x = (ex as f32 - ux * head - ortho_x * head * 0.5) as i32;
-            let p3y = (ey as f32 - uy * head - ortho_y * head * 0.5) as i32;
-            let fill = CreateSolidBrush(rgb_to_colorref(color));
-            let old_brush = SelectObject(hdc, fill as _);
-            let pts = [
-                windows_sys::Win32::Foundation::POINT { x: ex, y: ey },
-                windows_sys::Win32::Foundation::POINT { x: p2x, y: p2y },
-                windows_sys::Win32::Foundation::POINT { x: p3x, y: p3y },
-            ];
-            Polygon(hdc, pts.as_ptr(), pts.len() as i32);
-            SelectObject(hdc, old_brush);
-            DeleteObject(fill as _);
-            SelectObject(hdc, old_pen);
-            DeleteObject(pen as _);
+            let sink = geom.Open()?;
+            sink.BeginFigure(p1, D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(p2);
+            sink.AddLine(p3);
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+            ctx.FillGeometry(&geom, &brush_iface, None);
         }
+        Ok(())
     }
 
-    unsafe fn draw_shape(
-        &self,
-        hdc: HDC,
+    fn draw_shape(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
         kind: ShapeKind,
         bounds: Rect,
         outline: Color,
         fill: Color,
         stroke: f32,
-    ) {
+    ) -> Result<()> {
+        let outline_brush: ID2D1Brush = self.brush(outline)?.cast()?;
+        let fill_brush = if fill.a > 0 {
+            Some(self.brush(fill)?.cast::<ID2D1Brush>()?)
+        } else {
+            None
+        };
         unsafe {
-            let r = self.to_screen_rect(bounds);
-            let pen_w = ((stroke * self.view_scale) as i32).max(1);
-            let pen = CreatePen(PS_SOLID as i32, pen_w, rgb_to_colorref(outline));
-            let old_pen = SelectObject(hdc, pen as _);
-            let (brush, owned) = if fill.a > 0 {
-                (CreateSolidBrush(rgb_to_colorref(fill)), true)
-            } else {
-                (GetStockObject(NULL_BRUSH as i32) as HBRUSH, false)
-            };
-            let old_brush = SelectObject(hdc, brush as _);
             match kind {
                 ShapeKind::Rectangle => {
-                    Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+                    let r = D2D_RECT_F {
+                        left: bounds.x,
+                        top: bounds.y,
+                        right: bounds.x + bounds.w,
+                        bottom: bounds.y + bounds.h,
+                    };
+                    if let Some(fb) = &fill_brush {
+                        ctx.FillRectangle(&r, fb);
+                    }
+                    ctx.DrawRectangle(&r, &outline_brush, stroke, None);
                 }
                 ShapeKind::Ellipse => {
-                    Ellipse(hdc, r.left, r.top, r.right, r.bottom);
+                    let cx = bounds.x + bounds.w * 0.5;
+                    let cy = bounds.y + bounds.h * 0.5;
+                    let e = D2D1_ELLIPSE {
+                        point: Vector2 { X: cx, Y: cy },
+                        radiusX: bounds.w * 0.5,
+                        radiusY: bounds.h * 0.5,
+                    };
+                    if let Some(fb) = &fill_brush {
+                        ctx.FillEllipse(&e, fb);
+                    }
+                    ctx.DrawEllipse(&e, &outline_brush, stroke, None);
                 }
             }
-            SelectObject(hdc, old_brush);
-            if owned {
-                DeleteObject(brush as _);
-            }
-            SelectObject(hdc, old_pen);
-            DeleteObject(pen as _);
         }
+        Ok(())
     }
 
-    unsafe fn draw_text(&self, hdc: HDC, bounds: Rect, text: &str, color: Color, size: f32) {
+    fn draw_text(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        bounds: Rect,
+        text: &str,
+        color: Color,
+        size: f32,
+    ) -> Result<()> {
+        if text.is_empty() {
+            // Placeholder outline so empty text annotations are still visible.
+            let outline = self.brush(Color::rgb(0x80, 0x80, 0x80))?;
+            let outline_iface: ID2D1Brush = outline.cast()?;
+            let r = D2D_RECT_F {
+                left: bounds.x,
+                top: bounds.y,
+                right: bounds.x + bounds.w,
+                bottom: bounds.y + bounds.h,
+            };
+            unsafe {
+                ctx.DrawRectangle(&r, &outline_iface, 1.0, None);
+            }
+            return Ok(());
+        }
+        let brush: ID2D1Brush = self.brush(color)?.cast()?;
+        let format = self.gfx.dwrite.text_format("Segoe UI", size, false, false)?;
+        let text_w: Vec<u16> = text.encode_utf16().collect();
+        let layout = unsafe {
+            self.gfx.dwrite.factory.CreateTextLayout(
+                &text_w,
+                &format,
+                bounds.w.max(1.0),
+                bounds.h.max(1.0),
+            )?
+        };
         unsafe {
-            if text.is_empty() {
-                let r = self.to_screen_rect(bounds);
-                let pen = CreatePen(PS_SOLID as i32, 1, rgb_to_colorref(Color::rgb(180, 180, 180)));
-                let old_pen = SelectObject(hdc, pen as _);
-                let nb = GetStockObject(NULL_BRUSH as i32);
-                let old_brush = SelectObject(hdc, nb);
-                Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-                SelectObject(hdc, old_brush);
-                SelectObject(hdc, old_pen);
-                DeleteObject(pen as _);
-                return;
-            }
-            let (x, y) = self.to_screen(Point::new(bounds.x, bounds.y));
-            let font = CreateFontW(
-                -((size * self.view_scale) as i32),
-                0,
-                0,
-                0,
-                FW_NORMAL as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                OUT_DEFAULT_PRECIS as u32,
-                CLIP_DEFAULT_PRECIS as u32,
-                CLEARTYPE_QUALITY as u32,
-                VARIABLE_PITCH as u32,
-                wide("Segoe UI").as_ptr(),
+            ctx.DrawTextLayout(
+                Vector2 { X: bounds.x, Y: bounds.y },
+                &layout,
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
-            let old_font = SelectObject(hdc, font as _);
-            SetBkMode(hdc, TRANSPARENT as i32);
-            SetTextColor(hdc, rgb_to_colorref(color));
-            let tw: Vec<u16> = text.encode_utf16().collect();
-            TextOutW(hdc, x, y, tw.as_ptr(), tw.len() as i32);
-            SelectObject(hdc, old_font);
-            DeleteObject(font as _);
         }
+        Ok(())
     }
 
-    unsafe fn draw_step(
-        &self,
-        hdc: HDC,
+    fn draw_step(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
         center: Point,
         radius: f32,
         value: &str,
         fill: Color,
         text_color: Color,
-    ) {
-        unsafe {
-            let (cx, cy) = self.to_screen(center);
-            let r = (radius * self.view_scale) as i32;
-            let brush = CreateSolidBrush(rgb_to_colorref(fill));
-            let old_brush = SelectObject(hdc, brush as _);
-            let pen = CreatePen(PS_SOLID as i32, 1, rgb_to_colorref(fill));
-            let old_pen = SelectObject(hdc, pen as _);
-            Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-            SelectObject(hdc, old_pen);
-            SelectObject(hdc, old_brush);
-            DeleteObject(pen as _);
-            DeleteObject(brush as _);
-
-            let font = CreateFontW(
-                -((radius * self.view_scale * 1.3) as i32),
-                0,
-                0,
-                0,
-                700,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                OUT_DEFAULT_PRECIS as u32,
-                CLIP_DEFAULT_PRECIS as u32,
-                CLEARTYPE_QUALITY as u32,
-                VARIABLE_PITCH as u32,
-                wide("Segoe UI").as_ptr(),
-            );
-            let old_font = SelectObject(hdc, font as _);
-            SetBkMode(hdc, TRANSPARENT as i32);
-            SetTextColor(hdc, rgb_to_colorref(text_color));
-            let tw: Vec<u16> = value.encode_utf16().collect();
-            let approx_w = tw.len() as i32 * (radius as i32);
-            TextOutW(hdc, cx - approx_w / 4, cy - r, tw.as_ptr(), tw.len() as i32);
-            SelectObject(hdc, old_font);
-            DeleteObject(font as _);
-        }
-    }
-
-    unsafe fn draw_highlight(&self, hdc: HDC, bounds: Rect, color: Color) {
-        let approx = Color {
-            a: 255,
-            r: ((color.r as u16 + 220) / 2) as u8,
-            g: ((color.g as u16 + 220) / 2) as u8,
-            b: ((color.b as u16 + 220) / 2) as u8,
+    ) -> Result<()> {
+        let fill_brush: ID2D1Brush = self.brush(fill)?.cast()?;
+        let text_brush: ID2D1Brush = self.brush(text_color)?.cast()?;
+        let ellipse = D2D1_ELLIPSE {
+            point: Vector2 { X: center.x, Y: center.y },
+            radiusX: radius,
+            radiusY: radius,
         };
-        unsafe { self.draw_filled_rect(hdc, bounds, approx) }
-    }
-
-    unsafe fn draw_filled_rect(&self, hdc: HDC, bounds: Rect, color: Color) {
         unsafe {
-            let r = self.to_screen_rect(bounds);
-            let brush = CreateSolidBrush(rgb_to_colorref(color));
-            FillRect(hdc, &r, brush);
-            DeleteObject(brush as _);
+            ctx.FillEllipse(&ellipse, &fill_brush);
+            let format = self
+                .gfx
+                .dwrite
+                .text_format("Segoe UI", radius * 1.1, true, true)?;
+            let rect = D2D_RECT_F {
+                left: center.x - radius,
+                top: center.y - radius,
+                right: center.x + radius,
+                bottom: center.y + radius,
+            };
+            let text_w: Vec<u16> = value.encode_utf16().collect();
+            ctx.DrawText(
+                &text_w,
+                &format,
+                &rect,
+                &text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
         }
+        Ok(())
     }
 
-    unsafe fn draw_preview(&self, hdc: HDC, drag: Drag) {
+    fn draw_highlight(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        bounds: Rect,
+        color: Color,
+    ) -> Result<()> {
+        // Alpha-blend a translucent fill — premultiplied D2D bitmap + an alpha
+        // ~100/255 brush gives a clean highlighter tint over the underlying
+        // pixels. (True multiply-blend would need D2D1_PRIMITIVE_BLEND_MIN
+        // via SetPrimitiveBlend, which the windows 0.61 bindings don't
+        // expose for ID2D1DeviceContext; the alpha path is visually close.)
+        let blend = Color::rgba(color.r, color.g, color.b, 110);
+        let brush: ID2D1Brush = self.brush(blend)?.cast()?;
+        let rect = D2D_RECT_F {
+            left: bounds.x,
+            top: bounds.y,
+            right: bounds.x + bounds.w,
+            bottom: bounds.y + bounds.h,
+        };
         unsafe {
-            match self.active_tool {
-                Tool::Arrow => self.draw_arrow(hdc, drag.start, drag.current, self.style.color, self.style.stroke),
-                Tool::ShapeRect | Tool::ShapeEllipse => {
-                    let bounds = Rect::from_points(drag.start, drag.current);
-                    let kind = if self.active_tool == Tool::ShapeRect {
-                        ShapeKind::Rectangle
-                    } else {
-                        ShapeKind::Ellipse
-                    };
-                    let fill = Color { a: self.style.fill_alpha, ..self.style.color };
-                    self.draw_shape(hdc, kind, bounds, self.style.color, fill, self.style.stroke);
-                }
-                Tool::Highlighter => {
-                    let bounds = Rect::from_points(drag.start, drag.current);
-                    self.draw_highlight(hdc, bounds, self.style.color);
-                }
-                Tool::BlurGaussian | Tool::BlurSolid => {
-                    let bounds = Rect::from_points(drag.start, drag.current);
-                    self.draw_filled_rect(hdc, bounds, Color::rgba(0, 0, 0, 255));
-                }
-                Tool::SelectionRect => {
-                    let bounds = Rect::from_points(drag.start, drag.current);
-                    let r = self.to_screen_rect(bounds);
-                    let pen = CreatePen(PS_SOLID as i32, 1, rgb_to_colorref(Color::rgb(80, 160, 255)));
-                    let old_pen = SelectObject(hdc, pen as _);
-                    let nb = GetStockObject(NULL_BRUSH as i32);
-                    let old_brush = SelectObject(hdc, nb);
-                    Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-                    SelectObject(hdc, old_brush);
-                    SelectObject(hdc, old_pen);
-                    DeleteObject(pen as _);
-                }
-                _ => {}
+            ctx.FillRectangle(&rect, &brush);
+        }
+        Ok(())
+    }
+
+    fn draw_solid(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        bounds: Rect,
+        fill: Color,
+    ) -> Result<()> {
+        let brush: ID2D1Brush = self.brush(fill)?.cast()?;
+        let rect = D2D_RECT_F {
+            left: bounds.x,
+            top: bounds.y,
+            right: bounds.x + bounds.w,
+            bottom: bounds.y + bounds.h,
+        };
+        unsafe {
+            ctx.FillRectangle(&rect, &brush);
+        }
+        Ok(())
+    }
+
+    fn draw_blur(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        bounds: Rect,
+        intensity: f32,
+    ) -> Result<()> {
+        let Some(base) = &self.base else { return Ok(()) };
+        if self.gaussian.is_none() {
+            let eff = unsafe { ctx.CreateEffect(&CLSID_D2D1GaussianBlur)? };
+            self.gaussian = Some(eff);
+        }
+        let effect = self.gaussian.as_ref().unwrap();
+        unsafe {
+            let img: ID2D1Image = base.cast()?;
+            effect.SetInput(0, Some(&img), false);
+            let stdev = (intensity / 3.0).max(0.5);
+            let bytes = stdev.to_le_bytes();
+            effect.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &bytes,
+            )?;
+            let effect_out: ID2D1Image = effect.GetOutput()?;
+            // Draw only the band of the blurred output that overlaps the
+            // annotation bounds.
+            let dest_offset = Vector2 { X: bounds.x, Y: bounds.y };
+            let src = D2D_RECT_F {
+                left: bounds.x,
+                top: bounds.y,
+                right: bounds.x + bounds.w,
+                bottom: bounds.y + bounds.h,
+            };
+            ctx.DrawImage(
+                &effect_out,
+                Some(&dest_offset),
+                Some(&src),
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+        }
+        Ok(())
+    }
+
+    fn draw_magnify(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        source: Rect,
+        display: Rect,
+        line_width: f32,
+        color: Color,
+    ) -> Result<()> {
+        let Some(base) = self.base.clone() else { return Ok(()) };
+        let brush: ID2D1Brush = self.brush(color)?.cast()?;
+        let src = D2D_RECT_F {
+            left: source.x,
+            top: source.y,
+            right: source.x + source.w,
+            bottom: source.y + source.h,
+        };
+        let dst = D2D_RECT_F {
+            left: display.x,
+            top: display.y,
+            right: display.x + display.w,
+            bottom: display.y + display.h,
+        };
+        unsafe {
+            // High-quality scaled blit of the source band into the display rect.
+            let base_bm: windows::Win32::Graphics::Direct2D::ID2D1Bitmap = base.cast()?;
+            ctx.DrawBitmap(
+                &base_bm,
+                Some(&dst),
+                1.0,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                Some(&src),
+                None,
+            );
+            // Outline both rects + connector line.
+            ctx.DrawRectangle(&src, &brush, line_width, None);
+            ctx.DrawRectangle(&dst, &brush, line_width, None);
+            let p_src = Vector2 {
+                X: source.x + source.w * 0.5,
+                Y: source.y + source.h * 0.5,
+            };
+            let p_dst = Vector2 {
+                X: display.x + display.w * 0.5,
+                Y: display.y + display.h * 0.5,
+            };
+            ctx.DrawLine(p_src, p_dst, &brush, line_width, None);
+        }
+        Ok(())
+    }
+
+    fn draw_stamp(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        asset: u8,
+        bounds: Rect,
+    ) -> Result<()> {
+        // Lazy-decode the bundled stamp into a D2D bitmap.
+        let idx = (asset as usize).min(crate::editor::stamps::COUNT - 1);
+        if self.stamps[idx].is_none() {
+            let bm = crate::editor::stamps::bitmap(asset);
+            self.stamps[idx] = Some(crate::gfx::d2d::upload_bitmap(
+                &self.gfx.d2d.context,
+                &bm,
+            )?);
+        }
+        let stamp = self.stamps[idx].as_ref().unwrap().clone();
+        let dest = D2D_RECT_F {
+            left: bounds.x,
+            top: bounds.y,
+            right: bounds.x + bounds.w,
+            bottom: bounds.y + bounds.h,
+        };
+        unsafe {
+            let stamp_bm: windows::Win32::Graphics::Direct2D::ID2D1Bitmap = stamp.cast()?;
+            ctx.DrawBitmap(
+                &stamp_bm,
+                Some(&dest),
+                1.0,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
+    fn draw_preview(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        drag: Drag,
+    ) -> Result<()> {
+        match self.active_tool {
+            Tool::Arrow => self.draw_arrow(ctx, drag.start, drag.current, self.style.color, self.style.stroke, None),
+            Tool::BezierArrow => {
+                let dx = drag.current.x - drag.start.x;
+                let dy = drag.current.y - drag.start.y;
+                let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                let mid = Point::new((drag.start.x + drag.current.x) * 0.5, (drag.start.y + drag.current.y) * 0.5);
+                let nx = -dy / len;
+                let ny = dx / len;
+                let bend = (len * 0.25).min(80.0);
+                let b = Some(Point::new(mid.x + nx * bend, mid.y + ny * bend));
+                self.draw_arrow(ctx, drag.start, drag.current, self.style.color, self.style.stroke, b)
             }
+            Tool::Magnify => {
+                let bounds = Rect::from_points(drag.start, drag.current);
+                let brush: ID2D1Brush = self.brush(self.style.color)?.cast()?;
+                let r = D2D_RECT_F {
+                    left: bounds.x,
+                    top: bounds.y,
+                    right: bounds.x + bounds.w,
+                    bottom: bounds.y + bounds.h,
+                };
+                unsafe { ctx.DrawRectangle(&r, &brush, self.style.stroke, None) };
+                Ok(())
+            }
+            Tool::Stamp => Ok(()),
+            Tool::ShapeRect | Tool::ShapeEllipse => {
+                let bounds = Rect::from_points(drag.start, drag.current);
+                let kind = if self.active_tool == Tool::ShapeRect {
+                    ShapeKind::Rectangle
+                } else {
+                    ShapeKind::Ellipse
+                };
+                let fill = Color { a: self.style.fill_alpha, ..self.style.color };
+                self.draw_shape(ctx, kind, bounds, self.style.color, fill, self.style.stroke)
+            }
+            Tool::Highlighter => {
+                let bounds = Rect::from_points(drag.start, drag.current);
+                self.draw_highlight(ctx, bounds, self.style.color)
+            }
+            Tool::BlurGaussian => {
+                let bounds = Rect::from_points(drag.start, drag.current);
+                self.draw_blur(ctx, bounds, 12.0)
+            }
+            Tool::BlurSolid => {
+                let bounds = Rect::from_points(drag.start, drag.current);
+                self.draw_solid(ctx, bounds, Color::BLACK)
+            }
+            Tool::SelectionRect => {
+                let bounds = Rect::from_points(drag.start, drag.current);
+                let brush: ID2D1Brush = self.brush(Color::rgba(0x50, 0xA0, 0xFF, 0xFF))?.cast()?;
+                let r = D2D_RECT_F {
+                    left: bounds.x,
+                    top: bounds.y,
+                    right: bounds.x + bounds.w,
+                    bottom: bounds.y + bounds.h,
+                };
+                unsafe { ctx.DrawRectangle(&r, &brush, 1.0, None) };
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
-    unsafe fn draw_handles(&self, hdc: HDC, bb: Rect) {
+    fn draw_handles(
+        &mut self,
+        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
+        bb: Rect,
+    ) -> Result<()> {
+        let brush: ID2D1Brush = self.brush(Color::rgba(0x50, 0xA0, 0xFF, 0xFF))?.cast()?;
+        let r = D2D_RECT_F {
+            left: bb.x,
+            top: bb.y,
+            right: bb.x + bb.w,
+            bottom: bb.y + bb.h,
+        };
         unsafe {
-            let r = self.to_screen_rect(bb);
-            let outline = CreateSolidBrush(rgb_to_colorref(Color::rgb(80, 160, 255)));
-            FrameRect(hdc, &r, outline);
-            DeleteObject(outline as _);
+            ctx.DrawRectangle(&r, &brush, 1.0, None);
             for (cx, cy) in [
-                (r.left, r.top),
-                (r.right, r.top),
-                (r.left, r.bottom),
-                (r.right, r.bottom),
+                (bb.x, bb.y),
+                (bb.x + bb.w, bb.y),
+                (bb.x, bb.y + bb.h),
+                (bb.x + bb.w, bb.y + bb.h),
             ] {
-                let hr = RECT { left: cx - 3, top: cy - 3, right: cx + 3, bottom: cy + 3 };
-                let h = CreateSolidBrush(rgb_to_colorref(Color::rgb(80, 160, 255)));
-                FillRect(hdc, &hr, h);
-                DeleteObject(h as _);
+                let h = D2D_RECT_F {
+                    left: cx - HANDLE_HALF,
+                    top: cy - HANDLE_HALF,
+                    right: cx + HANDLE_HALF,
+                    bottom: cy + HANDLE_HALF,
+                };
+                ctx.FillRectangle(&h, &brush);
             }
         }
+        Ok(())
     }
 
     pub fn screen_to_doc(&self, x: f32, y: f32) -> Point {
@@ -452,17 +792,262 @@ impl Canvas {
         )
     }
 
+    pub fn doc_to_screen(&self, p: Point) -> (f32, f32) {
+        (
+            self.view_offset.0 + p.x * self.view_scale,
+            self.view_offset.1 + p.y * self.view_scale,
+        )
+    }
+
     pub fn flatten(&self) -> Result<Bitmap> {
         crate::editor::flatten::flatten(&self.doc)
     }
 }
 
-impl Drop for Canvas {
-    fn drop(&mut self) {
-        self.cleanup_dib();
+// --- Child window registration & wndproc ---
+
+pub fn register_class() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        let cname = crate::win::wide(CLASS_NAME);
+        let wc = WNDCLASSEXW {
+            cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: GetModuleHandleW(core::ptr::null()) as _,
+            hIcon: 0,
+            hCursor: LoadCursorW(0, IDC_ARROW),
+            hbrBackground: 0,
+            lpszMenuName: core::ptr::null(),
+            lpszClassName: cname.as_ptr(),
+            hIconSm: 0,
+        };
+        RegisterClassExW(&wc);
+    });
+}
+
+pub fn create_child(parent: HWND, rect: RECT) -> Result<HWND> {
+    register_class();
+    let cname = crate::win::wide(CLASS_NAME);
+    unsafe {
+        let hwnd = CreateWindowExW(
+            0,
+            cname.as_ptr(),
+            core::ptr::null(),
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            parent,
+            0,
+            GetModuleHandleW(core::ptr::null()) as _,
+            core::ptr::null(),
+        );
+        if hwnd == 0 {
+            return Err(Error::last_win32());
+        }
+        Ok(hwnd)
     }
 }
 
-fn rgb_to_colorref(c: Color) -> u32 {
-    (c.r as u32) | ((c.g as u32) << 8) | ((c.b as u32) << 16)
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    // Each child looks up the shared EditorState via the parent hwnd.
+    let parent = unsafe { GetParent(hwnd) };
+    let state = crate::editor::window::get_state(parent);
+    let Some(state) = state else {
+        return unsafe { DefWindowProcW(hwnd, msg, w, l) };
+    };
+    unsafe {
+        match msg {
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => 1,
+            WM_PAINT => {
+                // Validate the update region then draw via D2D Present.
+                let mut ps: windows_sys::Win32::Graphics::Gdi::PAINTSTRUCT = core::mem::zeroed();
+                windows_sys::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
+                {
+                    let mut st = state.borrow_mut();
+                    let _ = st.canvas.render();
+                }
+                windows_sys::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
+                0
+            }
+            WM_SIZE => {
+                let cw = (l & 0xFFFF) as u16 as u32;
+                let ch = ((l >> 16) & 0xFFFF) as u16 as u32;
+                let mut st = state.borrow_mut();
+                let _ = st.canvas.resize(cw.max(1), ch.max(1));
+                drop(st);
+                InvalidateRect(hwnd, core::ptr::null(), 0);
+                0
+            }
+            WM_LBUTTONDOWN => {
+                SetFocus(hwnd);
+                SetCapture(hwnd);
+                let x = (l & 0xFFFF) as i16 as i32;
+                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
+                let mut st = state.borrow_mut();
+                let p = st.canvas.screen_to_doc(x as f32, y as f32);
+                if st.canvas.active_tool == Tool::Move {
+                    st.canvas.selected = st.canvas.doc.topmost_hit(p);
+                    st.canvas.move_anchor = Some(p);
+                } else {
+                    st.canvas.drag = Some(Drag { start: p, current: p });
+                }
+                drop(st);
+                InvalidateRect(hwnd, core::ptr::null(), 0);
+                0
+            }
+            WM_MOUSEMOVE => {
+                let x = (l & 0xFFFF) as i16 as i32;
+                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
+                let mut st = state.borrow_mut();
+                let p = st.canvas.screen_to_doc(x as f32, y as f32);
+                if let Some(drag) = st.canvas.drag.as_mut() {
+                    drag.current = p;
+                    drop(st);
+                    InvalidateRect(hwnd, core::ptr::null(), 0);
+                    return 0;
+                }
+                if st.canvas.active_tool == Tool::Move {
+                    if let (Some(sel), Some(anchor)) = (st.canvas.selected, st.canvas.move_anchor) {
+                        if let Some(i) = st.canvas.doc.find_index(sel) {
+                            let dx = p.x - anchor.x;
+                            let dy = p.y - anchor.y;
+                            st.canvas.doc.annotations[i].translate(dx, dy);
+                            st.canvas.move_anchor = Some(p);
+                            drop(st);
+                            InvalidateRect(hwnd, core::ptr::null(), 0);
+                        }
+                    }
+                }
+                0
+            }
+            WM_LBUTTONUP => {
+                ReleaseCapture();
+                let mut text_spawn: Option<(u32, crate::editor::annotation::Rect, f32, f32, (f32, f32))> = None;
+                {
+                    let mut st = state.borrow_mut();
+                    if let Some(drag) = st.canvas.drag.take() {
+                        let tool = st.canvas.active_tool;
+                        let style = st.canvas.style;
+                        if let Some(cmd) =
+                            crate::editor::tools::commit_drag(tool, style, drag, &mut st.canvas.doc)
+                        {
+                            // Text annotations get the hosted EDIT spawned.
+                            if tool == Tool::Text {
+                                if let crate::editor::history::Command::Insert { ann, .. } = &cmd {
+                                    if let crate::editor::annotation::Annotation::Text {
+                                        id, bounds, size, ..
+                                    } = ann
+                                    {
+                                        text_spawn = Some((
+                                            *id,
+                                            *bounds,
+                                            *size,
+                                            st.canvas.view_scale,
+                                            st.canvas.view_offset,
+                                        ));
+                                    }
+                                }
+                            }
+                            st.history.push(cmd);
+                        }
+                    }
+                    st.canvas.move_anchor = None;
+                }
+                InvalidateRect(hwnd, core::ptr::null(), 0);
+                if let Some((id, bounds, size, scale, offset)) = text_spawn {
+                    let parent = GetParent(hwnd);
+                    let rect = crate::editor::text_edit::doc_rect_to_parent(scale, offset, bounds);
+                    let _ = crate::editor::text_edit::spawn(parent, hwnd, id, rect, "", size);
+                }
+                0
+            }
+            WM_LBUTTONDBLCLK => {
+                // Re-enter text edit if the double-click lands on an existing
+                // Text annotation.
+                let x = (l & 0xFFFF) as i16 as i32;
+                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
+                let target = {
+                    let st = state.borrow();
+                    let p = st.canvas.screen_to_doc(x as f32, y as f32);
+                    if let Some(id) = st.canvas.doc.topmost_hit(p) {
+                        if let Some(idx) = st.canvas.doc.find_index(id) {
+                            if let crate::editor::annotation::Annotation::Text {
+                                bounds, text, size, ..
+                            } = &st.canvas.doc.annotations[idx]
+                            {
+                                Some((
+                                    id,
+                                    *bounds,
+                                    text.clone(),
+                                    *size,
+                                    st.canvas.view_scale,
+                                    st.canvas.view_offset,
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some((id, bounds, text, size, scale, offset)) = target {
+                    let parent = GetParent(hwnd);
+                    let rect = crate::editor::text_edit::doc_rect_to_parent(scale, offset, bounds);
+                    let _ = crate::editor::text_edit::spawn(parent, hwnd, id, rect, &text, size);
+                }
+                0
+            }
+            WM_KEYDOWN => {
+                let ctrl = (GetKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
+                let key = w as u32;
+                let mut st = state.borrow_mut();
+                let mut invalidate = false;
+                if key == VK_ESCAPE as u32 {
+                    st.canvas.selected = None;
+                    invalidate = true;
+                } else if key == VK_DELETE as u32 || key == VK_BACK as u32 {
+                    if let Some(sel) = st.canvas.selected {
+                        if let Some(idx) = st.canvas.doc.find_index(sel) {
+                            let ann = st.canvas.doc.annotations.remove(idx);
+                            st.history.push(crate::editor::history::Command::Remove { index: idx, ann });
+                            st.canvas.selected = None;
+                            invalidate = true;
+                        }
+                    }
+                } else if ctrl && key == VK_Z as u32 {
+                    let s = &mut *st;
+                    s.history.undo(&mut s.canvas.doc);
+                    invalidate = true;
+                } else if ctrl && key == VK_Y as u32 {
+                    let s = &mut *st;
+                    s.history.redo(&mut s.canvas.doc);
+                    invalidate = true;
+                }
+                drop(st);
+                if invalidate {
+                    InvalidateRect(hwnd, core::ptr::null(), 0);
+                }
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
+// Suppress unused-import warnings for items that are about to be used by later phases.
+#[allow(dead_code)]
+fn _silence() {
+    let _: D2D1_PRIMITIVE_BLEND = D2D1_PRIMITIVE_BLEND_SOURCE_OVER;
+    let _ = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
+    let _: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+    let _: D2D1_BEZIER_SEGMENT = unsafe { core::mem::zeroed() };
 }

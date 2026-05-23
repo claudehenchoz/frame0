@@ -54,6 +54,60 @@ fn rasterize(bm: &mut Bitmap, ann: &Annotation) {
             BlurMode::Solid => raster_filled_rect(bm, *bounds, *fill),
             BlurMode::Blur => raster_box_blur(bm, *bounds, 12),
         },
+        // Magnify: CPU export shows only the outlines + connector. A proper
+        // scaled-bitmap path is a v2.1 polish.
+        Annotation::Magnify {
+            source,
+            display,
+            line_width,
+            color,
+            ..
+        } => {
+            raster_rect_outline(bm, *source, *color, *line_width);
+            raster_rect_outline(bm, *display, *color, *line_width);
+            raster_thick_line(
+                bm,
+                crate::editor::annotation::Point::new(source.x + source.w * 0.5, source.y + source.h * 0.5),
+                crate::editor::annotation::Point::new(display.x + display.w * 0.5, display.y + display.h * 0.5),
+                *color,
+                *line_width,
+            );
+        }
+        // Stamp: composite the bundled bitmap (alpha-blended) into the base.
+        Annotation::Stamp { asset, bounds, .. } => {
+            raster_stamp(bm, *asset, *bounds);
+        }
+    }
+}
+
+fn raster_stamp(bm: &mut Bitmap, asset: u8, bounds: Rect) {
+    let stamp = crate::editor::stamps::bitmap(asset);
+    let sw = stamp.width as f32;
+    let sh = stamp.height as f32;
+    let dw = bounds.w.max(1.0);
+    let dh = bounds.h.max(1.0);
+    let x0 = bounds.x as i32;
+    let y0 = bounds.y as i32;
+    let x1 = (bounds.x + dw) as i32;
+    let y1 = (bounds.y + dh) as i32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let u = ((x - x0) as f32 / dw * sw) as i32;
+            let v = ((y - y0) as f32 / dh * sh) as i32;
+            if u < 0 || v < 0 || (u as u32) >= stamp.width || (v as u32) >= stamp.height {
+                continue;
+            }
+            let i = ((v as u32 * stamp.width + u as u32) * 4) as usize;
+            let c = Color {
+                b: stamp.bgra[i],
+                g: stamp.bgra[i + 1],
+                r: stamp.bgra[i + 2],
+                a: stamp.bgra[i + 3],
+            };
+            if c.a > 0 {
+                put_pixel(bm, x, y, c);
+            }
+        }
     }
 }
 

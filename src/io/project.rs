@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 const MAGIC: &[u8; 4] = b"FRAM";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 const TAG_ARROW: u8 = 1;
 const TAG_SHAPE: u8 = 2;
@@ -26,6 +26,8 @@ const TAG_TEXT: u8 = 3;
 const TAG_STEP: u8 = 4;
 const TAG_HIGHLIGHT: u8 = 5;
 const TAG_BLUR: u8 = 6;
+const TAG_MAGNIFY: u8 = 7;
+const TAG_STAMP: u8 = 8;
 
 pub fn save(doc: &Document, path: &str) -> Result<()> {
     let mut buf: Vec<u8> = Vec::new();
@@ -59,7 +61,8 @@ pub fn load(path: &str) -> Result<Document> {
     if r.take(4)? != MAGIC {
         return Err(Error::msg("not a .frame file"));
     }
-    if r.u16()? != VERSION {
+    let version = r.u16()?;
+    if version != 1 && version != VERSION {
         return Err(Error::msg("unsupported project version"));
     }
     let png_len = r.u32()? as usize;
@@ -70,7 +73,7 @@ pub fn load(path: &str) -> Result<Document> {
     let count = r.u32()? as usize;
     let mut anns = Vec::with_capacity(count);
     for _ in 0..count {
-        anns.push(read_ann(&mut r)?);
+        anns.push(read_ann(&mut r, version)?);
     }
     Ok(Document {
         base,
@@ -88,6 +91,7 @@ fn write_ann(buf: &mut Vec<u8>, a: &Annotation) {
             end,
             color,
             stroke,
+            bezier,
         } => {
             buf.push(TAG_ARROW);
             buf.extend_from_slice(&id.to_le_bytes());
@@ -95,6 +99,14 @@ fn write_ann(buf: &mut Vec<u8>, a: &Annotation) {
             write_point(buf, *end);
             write_color(buf, *color);
             buf.extend_from_slice(&stroke.to_le_bytes());
+            // v2 extension: optional bezier control point.
+            match bezier {
+                Some(p) => {
+                    buf.push(1);
+                    write_point(buf, *p);
+                }
+                None => buf.push(0),
+            }
         }
         Annotation::Shape {
             id,
@@ -170,10 +182,36 @@ fn write_ann(buf: &mut Vec<u8>, a: &Annotation) {
             buf.extend_from_slice(&intensity.to_le_bytes());
             write_color(buf, *fill);
         }
+        Annotation::Magnify {
+            id,
+            source,
+            display,
+            line_width,
+            color,
+        } => {
+            buf.push(TAG_MAGNIFY);
+            buf.extend_from_slice(&id.to_le_bytes());
+            write_rect(buf, *source);
+            write_rect(buf, *display);
+            buf.extend_from_slice(&line_width.to_le_bytes());
+            write_color(buf, *color);
+        }
+        Annotation::Stamp {
+            id,
+            asset,
+            bounds,
+            rotation,
+        } => {
+            buf.push(TAG_STAMP);
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.push(*asset);
+            write_rect(buf, *bounds);
+            buf.extend_from_slice(&rotation.to_le_bytes());
+        }
     }
 }
 
-fn read_ann(r: &mut Reader) -> Result<Annotation> {
+fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
     let tag = r.u8()?;
     let id = r.u32()?;
     Ok(match tag {
@@ -183,6 +221,11 @@ fn read_ann(r: &mut Reader) -> Result<Annotation> {
             end: read_point(r)?,
             color: read_color(r)?,
             stroke: r.f32()?,
+            bezier: if version >= 2 {
+                if r.u8()? == 1 { Some(read_point(r)?) } else { None }
+            } else {
+                None
+            },
         },
         TAG_SHAPE => {
             let kind = if r.u8()? == 0 {
@@ -237,6 +280,19 @@ fn read_ann(r: &mut Reader) -> Result<Annotation> {
                 fill,
             }
         }
+        TAG_MAGNIFY => Annotation::Magnify {
+            id,
+            source: read_rect(r)?,
+            display: read_rect(r)?,
+            line_width: r.f32()?,
+            color: read_color(r)?,
+        },
+        TAG_STAMP => Annotation::Stamp {
+            id,
+            asset: r.u8()?,
+            bounds: read_rect(r)?,
+            rotation: r.f32()?,
+        },
         _ => return Err(Error::msg("unknown annotation tag")),
     })
 }

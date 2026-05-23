@@ -14,6 +14,11 @@ mod win;
 use error::Result;
 
 fn main() -> Result<()> {
+    // Kick off the COM/DLL warm-up before any synchronous setup. The bg thread
+    // races App::new — every ms it gets before App's synchronous Gfx::create
+    // shaves cold-start hotkey latency.
+    gfx::prewarm::spawn();
+
     win::com::init_apartment()?;
     win::dpi::enable_per_monitor_v2();
 

@@ -7,6 +7,7 @@ pub enum Tool {
     Move,
     SelectionRect,
     Arrow,
+    BezierArrow,
     ShapeRect,
     ShapeEllipse,
     Text,
@@ -14,6 +15,8 @@ pub enum Tool {
     Highlighter,
     BlurGaussian,
     BlurSolid,
+    Magnify,
+    Stamp,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -59,7 +62,31 @@ pub fn commit_drag(
             end: drag.current,
             color: style.color,
             stroke: style.stroke,
+            bezier: None,
         },
+        Tool::BezierArrow => {
+            // Default control point: 1/4 of the shaft's length offset
+            // perpendicular from its midpoint. Gives a noticeable but tasteful
+            // bend; user can adjust via property-panel edits (v2.1).
+            let dx = drag.current.x - drag.start.x;
+            let dy = drag.current.y - drag.start.y;
+            let len = (dx * dx + dy * dy).sqrt().max(1.0);
+            let mid = Point::new(
+                (drag.start.x + drag.current.x) * 0.5,
+                (drag.start.y + drag.current.y) * 0.5,
+            );
+            let nx = -dy / len;
+            let ny = dx / len;
+            let bend = (len * 0.25).min(80.0);
+            Annotation::Arrow {
+                id,
+                start: drag.start,
+                end: drag.current,
+                color: style.color,
+                stroke: style.stroke,
+                bezier: Some(Point::new(mid.x + nx * bend, mid.y + ny * bend)),
+            }
+        }
         Tool::ShapeRect => {
             if tiny {
                 return None;
@@ -164,6 +191,55 @@ pub fn commit_drag(
                 mode: BlurMode::Solid,
                 intensity: 0.0,
                 fill: Color::BLACK,
+            }
+        }
+        Tool::Magnify => {
+            if tiny {
+                return None;
+            }
+            // Source defaults to the centre of the display rect, half the size
+            // — a 2× zoom. User-editable in v2.1.
+            let cx = bounds.x + bounds.w * 0.5;
+            let cy = bounds.y + bounds.h * 0.5;
+            let sw = bounds.w * 0.5;
+            let sh = bounds.h * 0.5;
+            let source = Rect {
+                x: cx - sw * 0.5,
+                y: cy - sh * 0.5,
+                w: sw,
+                h: sh,
+            };
+            // Display sits offset to the right of the source so the connector
+            // line is visible.
+            let display = Rect {
+                x: bounds.x + bounds.w * 0.6,
+                y: bounds.y,
+                w: bounds.w,
+                h: bounds.h,
+            };
+            Annotation::Magnify {
+                id,
+                source,
+                display,
+                line_width: style.stroke,
+                color: style.color,
+            }
+        }
+        Tool::Stamp => {
+            // Default: place a 48×48 stamp at the click. Asset = 0 (the first
+            // bundled icon); picker UI is v2.1.
+            let size = if tiny { 48.0 } else { bounds.w.max(bounds.h).max(24.0) };
+            let stamp_bounds = Rect {
+                x: drag.start.x - size * 0.5,
+                y: drag.start.y - size * 0.5,
+                w: size,
+                h: size,
+            };
+            Annotation::Stamp {
+                id,
+                asset: 0,
+                bounds: stamp_bounds,
+                rotation: 0.0,
             }
         }
         Tool::Move | Tool::SelectionRect => return None,

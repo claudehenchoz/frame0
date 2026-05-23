@@ -3,6 +3,7 @@ pub mod color;
 pub mod d2d;
 pub mod dwrite;
 pub mod gdiplus;
+pub mod prewarm;
 
 use crate::error::Result;
 
