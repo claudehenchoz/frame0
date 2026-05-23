@@ -4,16 +4,143 @@ use crate::error::Result;
 use crate::gfx::bitmap::Bitmap;
 use crate::gfx::color::Color;
 
+const SSAA: u32 = 2;
+
 /// Software-rasterised flatten path. Supports all annotation types including
 /// text glyphs (GDI-rendered), bezier curves (subdivided), and magnify scaled
-/// bitmap compositing.
+/// bitmap compositing. Uses 2× supersampling anti-aliasing (SSAA) for all
+/// annotation edges so export/clipboard output matches the smooth D2D preview.
 pub fn flatten(doc: &Document) -> Result<Bitmap> {
-    let mut out = doc.base.clone();
-    let base = &doc.base;
+    let w = doc.base.width;
+    let h = doc.base.height;
+    let w2 = w * SSAA;
+    let h2 = h * SSAA;
+
+    // 1. Upsample base image to SSAA resolution (nearest neighbour).
+    let mut ssaa = Bitmap::new(w2, h2);
+    let sbgra = &doc.base.bgra;
+    for y in 0..h2 {
+        let sy = y / SSAA;
+        let src_off = (sy * w * 4) as usize;
+        for x in 0..w2 {
+            let sx = x / SSAA;
+            let si = src_off + (sx * 4) as usize;
+            let di = ((y * w2 + x) * 4) as usize;
+            ssaa.bgra[di..di + 4].copy_from_slice(&sbgra[si..si + 4]);
+        }
+    }
+    let ssaa_base = ssaa.clone();
+
+    // 2. Rasterise annotations at SSAA resolution (coordinates scaled by 2×
+    //    give the existing rasterizer sub-pixel precision).
     for ann in &doc.annotations {
-        rasterize(&mut out, base, ann);
+        rasterize(&mut ssaa, &ssaa_base, &scale_annotation(ann, SSAA as f32));
+    }
+
+    // 3. Downsample SSAA×SSAA blocks via box filter (averaging).
+    let mut out = Bitmap::new(w, h);
+    let block = (SSAA * SSAA) as u32;
+    for y in 0..h {
+        for x in 0..w {
+            let mut r = 0u32; let mut g = 0u32; let mut b = 0u32; let mut a = 0u32;
+            for dy in 0..SSAA {
+                for dx in 0..SSAA {
+                    let si = (((y * SSAA + dy) * w2 + (x * SSAA + dx)) * 4) as usize;
+                    b += ssaa.bgra[si] as u32;
+                    g += ssaa.bgra[si + 1] as u32;
+                    r += ssaa.bgra[si + 2] as u32;
+                    a += ssaa.bgra[si + 3] as u32;
+                }
+            }
+            let di = ((y * w + x) * 4) as usize;
+            out.bgra[di]     = (b / block) as u8;
+            out.bgra[di + 1] = (g / block) as u8;
+            out.bgra[di + 2] = (r / block) as u8;
+            out.bgra[di + 3] = (a / block) as u8;
+        }
     }
     Ok(out)
+}
+
+/// Return a copy of `ann` with all spatial coordinates and sizes multiplied
+/// by `s`. Non-spatial fields (colors, text strings, blur intensity, shape
+/// kind/rotation, stamp asset/rotation) are passed through unchanged.
+fn scale_annotation(ann: &Annotation, s: f32) -> Annotation {
+    match *ann {
+        Annotation::Arrow { id, start, end, color, stroke, bezier } => {
+            Annotation::Arrow {
+                id,
+                start: Point::new(start.x * s, start.y * s),
+                end: Point::new(end.x * s, end.y * s),
+                color,
+                stroke: stroke * s,
+                bezier: bezier.map(|b| Point::new(b.x * s, b.y * s)),
+            }
+        }
+        Annotation::Shape { id, kind, bounds, outline, fill, stroke, rotation } => {
+            Annotation::Shape {
+                id,
+                kind,
+                bounds: Rect { x: bounds.x * s, y: bounds.y * s, w: bounds.w * s, h: bounds.h * s },
+                outline,
+                fill,
+                stroke: stroke * s,
+                rotation,
+            }
+        }
+        Annotation::Text { id, bounds, ref text, color, size } => {
+            Annotation::Text {
+                id,
+                bounds: Rect { x: bounds.x * s, y: bounds.y * s, w: bounds.w * s, h: bounds.h * s },
+                text: text.clone(),
+                color,
+                size: size * s,
+            }
+        }
+        Annotation::Step { id, center, radius, ref value, fill, text } => {
+            Annotation::Step {
+                id,
+                center: Point::new(center.x * s, center.y * s),
+                radius: radius * s,
+                value: value.clone(),
+                fill,
+                text,
+            }
+        }
+        Annotation::Highlighter { id, bounds, color } => {
+            Annotation::Highlighter {
+                id,
+                bounds: Rect { x: bounds.x * s, y: bounds.y * s, w: bounds.w * s, h: bounds.h * s },
+                color,
+            }
+        }
+        Annotation::Blur { id, bounds, mode, fill, intensity } => {
+            Annotation::Blur {
+                id,
+                bounds: Rect { x: bounds.x * s, y: bounds.y * s, w: bounds.w * s, h: bounds.h * s },
+                mode,
+                fill,
+                intensity,
+            }
+        }
+        Annotation::Magnify { id, source, display, line_width, color } => {
+            Annotation::Magnify {
+                id,
+                source: Rect { x: source.x * s, y: source.y * s, w: source.w * s, h: source.h * s },
+                display: Rect { x: display.x * s, y: display.y * s, w: display.w * s, h: display.h * s },
+                line_width: line_width * s,
+                color,
+            }
+        }
+        Annotation::Stamp { id, asset, bounds, rotation } => {
+            Annotation::Stamp {
+                id,
+                asset,
+                bounds: Rect { x: bounds.x * s, y: bounds.y * s, w: bounds.w * s, h: bounds.h * s },
+                rotation,
+            }
+        }
+    }
 }
 
 fn rasterize(bm: &mut Bitmap, base: &Bitmap, ann: &Annotation) {
