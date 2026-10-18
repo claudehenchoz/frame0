@@ -1,19 +1,19 @@
 # AGENTS.md — AI Coding Agent Guide
 
-The single reference for AI agents working on `frame`: what it is, how to build and test it, how the code is laid out, and the gotchas that cost time. The product spec is `PROMPT.md`.
+The single reference for AI agents working on **Frame Zero** (package / binary name `frame0`): what it is, how to build and test it, how the code is laid out, and the gotchas that cost time. The product spec is `PROMPT.md`.
 
 ---
 
 ## What this is
 
-`frame` is a single-binary Windows screenshot + annotation tool: a persistent tray app with a Direct2D editor, written in Rust (nightly), windows-only. v3 implements everything in `PROMPT.md`:
+Frame Zero (`frame0`) is a single-binary Windows screenshot + annotation tool: a persistent tray app with a Direct2D editor, written in Rust (nightly), windows-only. v3 implements everything in `PROMPT.md`:
 
 - **Capture.**
   - Modes: region (loupe, keyboard nudge), full screen / per monitor, fixed region (typed size, optional position), window pick (hover highlight), open-window list (PrintWindow, so covered and minimized windows work), scrolling capture with stitching.
   - Timing: delayed capture, interval capture, repeat last.
   - Input from the clipboard or a file.
   - Presets, include-cursor, effects (border, drop shadow).
-  - Output to the editor, the clipboard or `Pictures\frame-*.png`.
+  - Output to the editor, the clipboard or `Pictures\frame0-*.png`.
 - **Editor tools.**
   - Move.
   - Selection: rect / ellipse / polygon / freehand, with delete (transparent or auto-fill), crop, invert, effects, copy, and lift-to-layer.
@@ -47,11 +47,11 @@ The single reference for AI agents working on `frame`: what it is, how to build 
 | Action | Command | Notes |
 |--------|---------|-------|
 | Type-check | `cargo +nightly check` | Fastest loop; use as default |
-| Release build | `cargo +nightly build --release` | → `target/x86_64-pc-windows-msvc/release/frame.exe` (~308 KB) |
+| Release build | `cargo +nightly build --release` | → `target/x86_64-pc-windows-msvc/release/frame0.exe` (~308 KB) |
 | Debug run | `cargo +nightly run` | Launches the tray app |
 
 - **Nightly is mandatory.** `rust-toolchain.toml` pins it; `.cargo/config.toml` uses `-Z build-std` with `panic=immediate-abort`, `location-detail=none`, `fmt-debug=none`, which stable can't satisfy. You need the `rust-src` component (`rustup component add rust-src --toolchain nightly`). The target is hardcoded to `x86_64-pc-windows-msvc`.
-- **Exit the tray before rebuilding.** The running exe is locked, and cargo fails with `failed to remove file … Access is denied`. To exit, right-click the tray icon → Exit, or `frame.exe --cmd 199`.
+- **Exit the tray before rebuilding.** The running exe is locked, and cargo fails with `failed to remove file … Access is denied`. To exit, right-click the tray icon → Exit, or `frame0.exe --cmd 199`.
 - **There are no tests.** A test runner would have to cope with `build-std` + `panic=abort`.
 
 ### Binary-size discipline
@@ -60,18 +60,18 @@ The ceiling is 1 MB and the target is <500 KB; v3 is ~308 KB.
 - Keep `format!` / `Debug` out of hot paths.
 - No proc-macro crates (`windows-implement`, `serde_derive`, `thiserror`).
 - No new crates without a reason.
-- Measure after non-trivial changes: `ls -la target/x86_64-pc-windows-msvc/release/frame.exe`.
+- Measure after non-trivial changes: `ls -la target/x86_64-pc-windows-msvc/release/frame0.exe`.
 
 ### Testing the GUI (lessons learned)
 
 There's no test harness; verify by driving the real app:
 
-- **Driving the tray.** `frame.exe --cmd <id> [--pid <pid>]` posts a tray command to a running instance. IDs are the `CMD_*` consts in `app.rs`: e.g. 100 region, 101 full screen, 199 exit.
-- **Isolated config.** `FRAME_INI=<absolute path>` uses a separate ini (and hotkey), so a test instance doesn't clash with the user's.
-- **Driving windows.** Send messages straight to the HWNDs (`WM_LBUTTONDOWN/MOVE/UP` with client coordinates to `frame.editor.canvas`, `WM_KEYDOWN` for tool letters, `WM_COMMAND` with the editor's `CMD_*` to `frame.editor`). Avoid global synthetic input on the user's desktop: it can land in their terminal.
-- **Finding windows.** From PowerShell, ANSI `FindWindow` failed to find frame's windows; enumerate with `EnumChildWindows(IntPtr.Zero, …)` + `GetClassName`. `EnumChildWindows` is recursive: the property panel has its own `Edit` (stamp search), so check `GetParent` when looking for the in-place text EDIT.
+- **Driving the tray.** `frame0.exe --cmd <id> [--pid <pid>]` posts a tray command to a running instance. IDs are the `CMD_*` consts in `app.rs`: e.g. 100 region, 101 full screen, 199 exit.
+- **Isolated config.** `FRAME0_INI=<absolute path>` uses a separate ini (and hotkey), so a test instance doesn't clash with the user's.
+- **Driving windows.** Send messages straight to the HWNDs (`WM_LBUTTONDOWN/MOVE/UP` with client coordinates to `frame0.editor.canvas`, `WM_KEYDOWN` for tool letters, `WM_COMMAND` with the editor's `CMD_*` to `frame0.editor`). Avoid global synthetic input on the user's desktop: it can land in their terminal.
+- **Finding windows.** From PowerShell, ANSI `FindWindow` failed to find frame0's windows; enumerate with `EnumChildWindows(IntPtr.Zero, …)` + `GetClassName`. `EnumChildWindows` is recursive: the property panel has its own `Edit` (stamp search), so check `GetParent` when looking for the in-place text EDIT.
 - **Sandbox.** The tool sandbox hides other processes' windows; UI-automation scripts must run unsandboxed. Screenshots: `System.Drawing` `CopyFromScreen` after `SetProcessDPIAware`.
-- **Cleanup.** Kill test instances **by PID only**, never `taskkill /IM frame.exe`.
+- **Cleanup.** Kill test instances **by PID only**, never `taskkill /IM frame0.exe`.
 
 ---
 
@@ -82,7 +82,7 @@ src/main.rs                 Entry: --cmd forwarding, prewarm thread, COM + DPI i
 src/app.rs                  App: tray message window, tray menu (Menu builder), CMD_* ids,
                             run_capture pipeline (delay timer → grab → effects → output),
                             presets, interval timer, hotkey, editor lifecycle
-src/config.rs               frame.ini (GetPrivateProfileStringW), options + presets, FRAME_INI
+src/config.rs               frame0.ini (GetPrivateProfileStringW), options + presets, FRAME0_INI
 src/error.rs                Error (Hr / Win32 / Generic), Result; From<windows::core::Error>
 │
 ├── capture/
@@ -160,9 +160,9 @@ Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). H
 ### Editor window topology
 
 `EditorWindow` is a top-level parent with three children:
-- **Toolbar** (`frame.editor.toolbar`). GDI, double-buffered. Tool icons are Segoe Fluent Icons glyphs, falling back to Segoe MDL2 Assets on Windows 10 (detected with `GetTextFaceW`). Palette clicks recolour the selection too.
-- **Canvas** (`frame.editor.canvas`). Owns a DXGI flip-model swap chain and the whole interaction state machine. Has `WS_CLIPSIBLINGS` so the text EDIT sibling shows above it. It has keyboard focus; `window::accelerator` maps Ctrl-shortcuts to menu `CMD_*` ids, which are posted to the parent as `WM_COMMAND`. Plain letters switch tools (`Tool::key`).
-- **Property panel** (`frame.editor.property`). GDI. Built from a declarative `Row` list (`rows()`), laid out by `layout()`, clicks dispatched by `apply()`. It shows the selected annotation's properties, or the tool's when nothing is selected. Edits change the quick style (`ToolStyle`) **and** the selection, so later annotations inherit them. The stamp grid is rendered through `render::flatten` (so emoji are in colour) and cached.
+- **Toolbar** (`frame0.editor.toolbar`). GDI, double-buffered. Tool icons are Segoe Fluent Icons glyphs, falling back to Segoe MDL2 Assets on Windows 10 (detected with `GetTextFaceW`). Palette clicks recolour the selection too.
+- **Canvas** (`frame0.editor.canvas`). Owns a DXGI flip-model swap chain and the whole interaction state machine. Has `WS_CLIPSIBLINGS` so the text EDIT sibling shows above it. It has keyboard focus; `window::accelerator` maps Ctrl-shortcuts to menu `CMD_*` ids, which are posted to the parent as `WM_COMMAND`. Plain letters switch tools (`Tool::key`).
+- **Property panel** (`frame0.editor.property`). GDI. Built from a declarative `Row` list (`rows()`), laid out by `layout()`, clicks dispatched by `apply()`. It shows the selected annotation's properties, or the tool's when nothing is selected. Edits change the quick style (`ToolStyle`) **and** the selection, so later annotations inherit them. The stamp grid is rendered through `render::flatten` (so emoji are in colour) and cached.
 
 **Shared state.** `EditorState` holds the `Canvas` (which owns `History`), the current path, a weak ref to the app, and the child hwnds. It lives in `thread_local! HashMap<HWND, Rc<RefCell<EditorState>>>`, keyed by the parent **and every child**. Child wndprocs look it up via `window::get_state(GetParent(hwnd))`. If you add a child window, insert it into that map and clear it on `WM_DESTROY`. Use `try_borrow` in paint paths: a modal dialog can re-enter while a borrow is held.
 
@@ -191,7 +191,7 @@ Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). H
 - **Shadows.** The annotation is recorded into an `ID2D1CommandList`, fed through `CLSID_D2D1Shadow` (drawn offset), then drawn plain.
 - **Blur** = Gaussian effect on the base (border mode HARD), drawn clipped to the bounds. **Pixelate** = a CPU block-average bitmap (`pixels::pixelate_blocks`), cached and drawn scaled with nearest-neighbour. `RenderOpts { secure: true }` draws blur/pixelate as solid fills (the export prompt offers this).
 - **Highlighter** = translucent fill. MIN blending vanishes on dark screenshots, and `D2D1_PRIMITIVE_BLEND_MULTIPLY` doesn't exist in windows 0.61 (only SOURCE_OVER / COPY / MIN / MAX / ADD), so don't go looking for it.
-- **Stamps.** `e:<emoji>` is drawn with DirectWrite `D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` (Segoe UI Emoji); `l:<TEXT>` is a vector rounded badge; `f:<path>` is a user image from `%APPDATA%\frame\stamps\[category\]`. User stamp pixels are embedded in `.frame` files and re-registered with `stamps::register` on load.
+- **Stamps.** `e:<emoji>` is drawn with DirectWrite `D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` (Segoe UI Emoji); `l:<TEXT>` is a vector rounded badge; `f:<path>` is a user image from `%APPDATA%\frame0\stamps\[category\]`. User stamp pixels are embedded in `.frame` files and re-registered with `stamps::register` on load.
 - **Uploads.** `gfx::d2d::upload_bitmap` premultiplies when the bitmap has any alpha < 255 (cut-out / transparent fill / pasted PNGs). The canvas draws a checkerboard behind the page.
 - **Device loss.** On `D2DERR_RECREATE_TARGET`, `Canvas::render` drops the swap chain, target, checker / dash and `Renderer` resources, then re-attaches. The `ID2D1DeviceContext` is shared process-wide; always `SetTarget(None)` after `EndDraw`.
 
@@ -205,6 +205,8 @@ Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). H
 
 ### `.frame` format (`io/project.rs`)
 
+The project extension and `FRAM` magic kept their pre-rename names so existing projects still open.
+
 Little-endian:
 1. `b"FRAM"` magic.
 2. `u16` version (3).
@@ -217,7 +219,7 @@ Tags 1–10: Arrow, Shape, Text, Step, Highlight, Blur, Magnify, Stamp, Callout,
 
 ### Persistence (`config.rs`)
 
-- **Ini path.** `%APPDATA%\frame\frame.ini` (or `FRAME_INI`), written with a UTF-16 BOM so non-ASCII preset names survive.
+- **Ini path.** `%APPDATA%\frame0\frame0.ini` (or `FRAME0_INI`), written with a UTF-16 BOM so non-ASCII preset names survive. A pre-rename `%APPDATA%\frame` folder (with `frame.ini`) is moved there on first run.
 - **Sections.**
   - `[hotkey] capture`: default `Ctrl+Win+PgDn`.
   - `[capture]`: `include_cursor`, `delay`, `interval`, `output` (`editor` / `clipboard` / `file`), `effects` (bitflags), `fixed_w`, `fixed_h`.

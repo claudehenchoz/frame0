@@ -88,7 +88,7 @@ const C_ICON_IDLE: u32 = 0x00C8C8CA;
 const C_ICON_ACTIVE: u32 = 0x00FFFFFF;
 const C_TEXT_LABEL: u32 = 0x009D9A9A;
 
-const CLASS_NAME: &str = "frame.editor.toolbar";
+const CLASS_NAME: &str = "frame0.editor.toolbar";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Hit {

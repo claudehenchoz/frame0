@@ -15,8 +15,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_TOPMOST, MessageBoxW, SetTimer, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_TIMER, WS_OVERLAPPED,
 };
 
-pub const TRAY_CLASS: &str = "frame.tray.msg";
-const TIP: &str = "frame – screenshot tool";
+pub const TRAY_CLASS: &str = "frame0.tray.msg";
+const TIP: &str = "Frame Zero – screenshot tool";
 
 // Tray menu command ids.
 const CMD_TAKE: u16 = 100;
@@ -89,7 +89,7 @@ impl App {
 
         let hwnd = create_window(&WindowOpts {
             class,
-            title: "frame",
+            title: "Frame Zero",
             ex_style: 0,
             style: WS_OVERLAPPED,
             x: 0,
@@ -110,7 +110,7 @@ impl App {
             let mut msg = String::from("The hotkey ");
             msg.push_str(&config.hotkey_str);
             msg.push_str(" is in use by another program. Choose another via Options ▸ Set hotkey…");
-            tray.balloon("frame: hotkey unavailable", &msg, true);
+            tray.balloon("Frame Zero: hotkey unavailable", &msg, true);
         }
 
         let gfx = Rc::new(Gfx::create()?);
@@ -424,7 +424,7 @@ impl App {
     }
 
     fn countdown_tip(&self) {
-        let mut t = String::from("frame – capturing in ");
+        let mut t = String::from("Frame Zero – capturing in ");
         t.push_str(&self.rt.borrow().countdown.to_string());
         t.push_str(" s");
         self.tray.modify_tip(&t);
@@ -440,7 +440,7 @@ impl App {
         let iv = self.rt.borrow().interval.as_ref().map(|s| s.interval);
         match iv {
             Some(n) => {
-                let mut t = String::from("frame – interval capture every ");
+                let mut t = String::from("Frame Zero – interval capture every ");
                 t.push_str(&n.to_string());
                 t.push_str(" s");
                 self.tray.modify_tip(&t);
@@ -611,7 +611,7 @@ impl App {
             Output::Clipboard => {
                 let png = crate::gfx::gdiplus::encode_png_bytes(&bmp).unwrap_or_default();
                 if crate::win::clipboard::write_image(self.hwnd, &bmp, &png).is_ok() && !quiet {
-                    self.tray.balloon("frame", "Screenshot copied to the clipboard.", false);
+                    self.tray.balloon("Frame Zero", "Screenshot copied to the clipboard.", false);
                 }
             }
             Output::File => {
@@ -620,10 +620,10 @@ impl App {
                     Ok(()) if !quiet => {
                         let mut t = String::from("Saved ");
                         t.push_str(&path);
-                        self.tray.balloon("frame", &t, false);
+                        self.tray.balloon("Frame Zero", &t, false);
                     }
                     Ok(()) => {}
-                    Err(_) => self.tray.balloon("frame", "Could not save the screenshot.", true),
+                    Err(_) => self.tray.balloon("Frame Zero", "Could not save the screenshot.", true),
                 }
             }
         }
@@ -768,7 +768,7 @@ fn message(_owner: HWND, text: &str) {
         MessageBoxW(
             0,
             wide(text).as_ptr(),
-            wide("frame").as_ptr(),
+            wide("Frame Zero").as_ptr(),
             MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
         );
     }
@@ -792,7 +792,7 @@ fn open_stamps_folder() {
     }
 }
 
-/// `%USERPROFILE%\Pictures\frame-YYYY-MM-DD_HH-MM-SS[-n].png`
+/// `%USERPROFILE%\Pictures\frame0-YYYY-MM-DD_HH-MM-SS[-n].png`
 fn build_save_path() -> String {
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
     let mut t = unsafe { core::mem::zeroed() };
@@ -802,7 +802,7 @@ fn build_save_path() -> String {
         .unwrap_or_else(|_| ".".to_string());
     let _ = std::fs::create_dir_all(&dir);
     let base = format!(
-        "{}\\frame-{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
+        "{}\\frame0-{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
         dir, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
     );
     let mut path = format!("{}.png", base);
@@ -857,7 +857,7 @@ unsafe extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 
-/// `frame.exe --cmd <id> [--pid <pid>]`: post a tray command to a running
+/// `frame0.exe --cmd <id> [--pid <pid>]`: post a tray command to a running
 /// instance (scripting / testing). Returns true if handled.
 pub fn forward_command() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId, PostMessageW};

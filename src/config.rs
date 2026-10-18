@@ -1,5 +1,6 @@
-//! `frame.ini` persistence (GetPrivateProfileString). The path defaults to
-//! `%APPDATA%\frame\frame.ini` and can be overridden with `FRAME_INI`.
+//! `frame0.ini` persistence (GetPrivateProfileString). The path defaults to
+//! `%APPDATA%\frame0\frame0.ini` and can be overridden with `FRAME0_INI`.
+//! The pre-rename `%APPDATA%\frame` folder is moved over on first run.
 
 use crate::capture::{CaptureSettings, Mode, Output};
 use crate::win::hotkey::HotkeySpec;
@@ -8,8 +9,11 @@ use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::UI::Shell::{FOLDERID_RoamingAppData, KF_FLAG_CREATE, SHGetKnownFolderPath};
 use windows_sys::core::PWSTR;
 
-const APP_DIR: &str = "frame";
-const INI_NAME: &str = "frame.ini";
+const APP_DIR: &str = "frame0";
+const INI_NAME: &str = "frame0.ini";
+/// Pre-rename locations, migrated once.
+const OLD_APP_DIR: &str = "frame";
+const OLD_INI_NAME: &str = "frame.ini";
 pub const DEFAULT_HOTKEY: &str = "Ctrl+Win+PgDn";
 
 pub struct Config {
@@ -187,7 +191,7 @@ pub fn read_settings(path: &str, sec: &str) -> Option<CaptureSettings> {
     Some(s)
 }
 
-/// `%APPDATA%\frame` (created if missing).
+/// `%APPDATA%\frame0` (created if missing).
 pub fn app_dir() -> String {
     let mut path_pw: PWSTR = core::ptr::null_mut();
     unsafe {
@@ -205,14 +209,21 @@ pub fn app_dir() -> String {
         // SHGetKnownFolderPath buffer must be freed with CoTaskMemFree
         windows_sys::Win32::System::Com::CoTaskMemFree(path_pw as _);
         dir.push('\\');
+        let old = format!("{}{}", dir, OLD_APP_DIR);
         dir.push_str(APP_DIR);
+        if !std::path::Path::new(&dir).exists() && std::path::Path::new(&old).is_dir() {
+            // One-time move of the pre-rename settings + stamps folder.
+            if std::fs::rename(&old, &dir).is_ok() {
+                let _ = std::fs::rename(format!("{}\\{}", dir, OLD_INI_NAME), format!("{}\\{}", dir, INI_NAME));
+            }
+        }
         let _ = std::fs::create_dir_all(&dir);
         dir
     }
 }
 
 fn ensure_ini_path() -> String {
-    if let Ok(p) = std::env::var("FRAME_INI") {
+    if let Ok(p) = std::env::var("FRAME0_INI") {
         if !p.is_empty() {
             return p;
         }

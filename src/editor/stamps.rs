@@ -3,7 +3,7 @@
 //! Built-in stamps cost nothing in the binary: emoji stamps (`"e:<emoji>"`)
 //! render through DirectWrite's colour-font path (Segoe UI Emoji), and label
 //! badges (`"l:<TEXT>"`) are drawn as vector rounded rectangles. User stamps
-//! are PNG/JPG files dropped into `%APPDATA%\frame\stamps\` — a file in a
+//! are PNG/JPG files dropped into `%APPDATA%\frame0\stamps\` — a file in a
 //! sub-folder lands in that category, files in the root land in "Custom".
 //! Their asset id is `"f:<path relative to the stamps folder>"`.
 
@@ -102,8 +102,7 @@ pub struct Entry {
 }
 
 pub fn stamps_dir() -> String {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    format!("{}\\frame\\stamps", base)
+    format!("{}\\stamps", crate::config::app_dir())
 }
 
 thread_local! {

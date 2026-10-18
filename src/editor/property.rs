@@ -35,7 +35,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_PAINT, WM_SETFONT, WM_SIZE, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_VISIBLE,
 };
 
-const CLASS_NAME: &str = "frame.editor.property";
+const CLASS_NAME: &str = "frame0.editor.property";
 
 const PAD: i32 = 10;
 const ROW_H: i32 = 26;

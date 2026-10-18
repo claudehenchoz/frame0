@@ -48,7 +48,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
-const CLASS_NAME: &str = "frame.editor.canvas";
+const CLASS_NAME: &str = "frame0.editor.canvas";
 /// Handle half-size in screen pixels.
 const HANDLE: f32 = 5.0;
 const ROT_OFFSET: f32 = 28.0;

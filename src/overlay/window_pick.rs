@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_PAINT, WM_RBUTTONDOWN,
 };
 
-const CLASS_NAME: &str = "frame.overlay.windowpick";
+const CLASS_NAME: &str = "frame0.overlay.windowpick";
 
 struct State {
     bd: Backdrop,

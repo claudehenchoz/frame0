@@ -24,7 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_DLGMODALFRAME, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
-const CLASS_NAME: &str = "frame.prompt";
+const CLASS_NAME: &str = "frame0.prompt";
 const EM_SETSEL: u32 = 0x00B1;
 const DM_GETDEFID: u32 = 0x0400;
 const ID_EDIT0: usize = 1000;

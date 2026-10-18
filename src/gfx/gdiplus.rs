@@ -138,7 +138,7 @@ fn temp_path(ext: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = std::env::var("TEMP").unwrap_or_else(|_| ".".into());
-    format!("{}\\frame-tmp-{}.{}", dir, ts, ext)
+    format!("{}\\frame0-tmp-{}.{}", dir, ts, ext)
 }
 
 pub fn decode_file(path: &str) -> Result<Bitmap> {

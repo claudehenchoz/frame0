@@ -30,7 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
-const CLASS_NAME: &str = "frame.editor";
+const CLASS_NAME: &str = "frame0.editor";
 
 pub struct EditorWindow {
     pub hwnd: HWND,
@@ -94,7 +94,7 @@ impl EditorWindow {
             let hwnd = CreateWindowExW(
                 0,
                 cname.as_ptr(),
-                wide("frame").as_ptr(),
+                wide("Frame Zero").as_ptr(),
                 WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -232,7 +232,7 @@ fn update_title(state: &Rc<RefCell<EditorState>>) {
         .map(|p| p.rsplit('\\').next().unwrap_or(p).to_string())
         .unwrap_or_else(|| "Untitled".to_string());
     let t = format!(
-        "{}{} — frame ({}×{}, {}%)",
+        "{}{} — Frame Zero ({}×{}, {}%)",
         if st.canvas.dirty { "• " } else { "" },
         name,
         st.canvas.doc.base.width,
@@ -317,7 +317,7 @@ fn confirm_discard(hwnd: HWND, state: &Rc<RefCell<EditorState>>) -> bool {
         MessageBoxW(
             hwnd,
             wide("Save changes to this screenshot as a .frame project?").as_ptr(),
-            wide("frame").as_ptr(),
+            wide("Frame Zero").as_ptr(),
             MB_YESNOCANCEL | MB_ICONWARNING,
         )
     };
@@ -584,7 +584,7 @@ fn save_project(hwnd: HWND, state: &Rc<RefCell<EditorState>>, force_dialog: bool
     let existing = state.borrow().current_path.clone();
     let path = match existing {
         Some(p) if !force_dialog => Some(p),
-        _ => crate::win::dialog::save_file(hwnd, "Save project", "Frame project|*.frame|All files|*.*", "screenshot.frame").ok().flatten(),
+        _ => crate::win::dialog::save_file(hwnd, "Save project", "Frame Zero project|*.frame|All files|*.*", "screenshot.frame").ok().flatten(),
     };
     let Some(mut p) = path else { return false };
     if !p.to_ascii_lowercase().ends_with(".frame") {
@@ -603,7 +603,7 @@ fn save_project(hwnd: HWND, state: &Rc<RefCell<EditorState>>, force_dialog: bool
 
 fn message(hwnd: HWND, text: &str) {
     unsafe {
-        MessageBoxW(hwnd, wide(text).as_ptr(), wide("frame").as_ptr(), MB_ICONWARNING);
+        MessageBoxW(hwnd, wide(text).as_ptr(), wide("Frame Zero").as_ptr(), MB_ICONWARNING);
     }
 }
 
@@ -617,7 +617,7 @@ fn ask_secure(hwnd: HWND, state: &Rc<RefCell<EditorState>>) -> Option<bool> {
         MessageBoxW(
             hwnd,
             wide("This image contains blurred or pixelated areas.\n\nBlur and pixelation can sometimes be reversed by third-party tools, so they are not safe for hiding sensitive information.\n\nExport them as solid (irreversible) redactions instead?").as_ptr(),
-            wide("frame — redaction warning").as_ptr(),
+            wide("Frame Zero — redaction warning").as_ptr(),
             MB_YESNOCANCEL | MB_ICONWARNING,
         )
     };

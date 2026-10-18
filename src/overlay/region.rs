@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
 };
 
-const CLASS_NAME: &str = "frame.overlay.region";
+const CLASS_NAME: &str = "frame0.overlay.region";
 const LOUPE_SRC: i32 = 21; // source pixels across (odd → centre pixel)
 const LOUPE_ZOOM: i32 = 6;
 
