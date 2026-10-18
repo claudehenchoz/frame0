@@ -1,3 +1,20 @@
+// Frame Zero - a tiny Windows screenshot and annotation tool
+// Copyright (C) 2026 Claude Henchoz
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 //! Toolbar child window. GDI-rendered strip across the top of the editor.
 //! Owns its own WM_PAINT (double-buffered): tool buttons drawn with Segoe
 //! Fluent Icons glyphs (Segoe MDL2 Assets on Windows 10), colour swatches with

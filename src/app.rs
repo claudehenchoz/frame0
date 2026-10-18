@@ -1,3 +1,20 @@
+// Frame Zero - a tiny Windows screenshot and annotation tool
+// Copyright (C) 2026 Claude Henchoz
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 use crate::capture::{self, CaptureSettings, FX_BORDER, FX_SHADOW, Mode, Output, ScreenRect};
 use crate::config::Config;
 use crate::editor::{Document, EditorWindow};
@@ -44,6 +61,7 @@ const CMD_INTERVAL_START: u16 = 170;
 const CMD_INTERVAL_STOP: u16 = 171;
 const CMD_HOTKEY: u16 = 180;
 const CMD_STAMPS: u16 = 181;
+const CMD_ABOUT: u16 = 190;
 const CMD_EXIT: u16 = 199;
 const CMD_MONITOR: u16 = 200; // + index (< 64)
 const CMD_OPEN_WINDOW: u16 = 300; // + index (< 300)
@@ -302,6 +320,7 @@ impl App {
         m.sub("&Options", om, true);
 
         m.sep();
+        m.item(CMD_ABOUT, "&About Frame Zero");
         m.item(CMD_EXIT, "E&xit");
         m
     }
@@ -355,6 +374,11 @@ impl App {
             CMD_INTERVAL_STOP => self.stop_interval(),
             CMD_HOTKEY => self.set_hotkey(),
             CMD_STAMPS => open_stamps_folder(),
+            CMD_ABOUT => {
+                self.set_busy(true);
+                crate::win::about::show(0);
+                self.set_busy(false);
+            }
             c if (CMD_MONITOR..CMD_MONITOR + 64).contains(&c) => {
                 let mut s = self.settings(Mode::Monitor);
                 s.monitor = (c - CMD_MONITOR) as u32;

@@ -1,3 +1,20 @@
+// Frame Zero - a tiny Windows screenshot and annotation tool
+// Copyright (C) 2026 Claude Henchoz
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 //! Editor parent window. Owns the menu, the layout of three children (toolbar,
 //! canvas, property panel), and the shared `EditorState`. Child windows look
 //! the state up via the thread-local map keyed by the parent's HWND.
@@ -198,12 +215,12 @@ fn register_class() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: GetModuleHandleW(core::ptr::null()) as _,
-            hIcon: 0,
+            hIcon: crate::win::app_icon(false),
             hCursor: LoadCursorW(0, IDC_ARROW),
             hbrBackground: 0,
             lpszMenuName: core::ptr::null(),
             lpszClassName: cname.as_ptr(),
-            hIconSm: 0,
+            hIconSm: crate::win::app_icon(true),
         };
         RegisterClassExW(&wc);
     });
@@ -369,6 +386,7 @@ pub const CMD_ZOOM_IN: u16 = 250;
 pub const CMD_ZOOM_OUT: u16 = 251;
 pub const CMD_ZOOM_FIT: u16 = 252;
 pub const CMD_ZOOM_100: u16 = 253;
+pub const CMD_ABOUT: u16 = 260;
 pub const CMD_TOOL_BASE: u16 = 300;
 
 const VK_OEM_PLUS: u16 = 0xBB;
@@ -512,6 +530,10 @@ unsafe fn attach_menu(hwnd: HWND) {
         item(view, CMD_ZOOM_FIT, "Fit to window\tCtrl+0");
         item(view, CMD_ZOOM_100, "Actual size\tCtrl+1");
         sub(bar, view, "&View");
+
+        let help = CreatePopupMenu();
+        item(help, CMD_ABOUT, "About Frame Zero");
+        sub(bar, help, "&Help");
         SetMenu(hwnd, bar);
     }
 }
@@ -706,6 +728,7 @@ pub fn handle_command(hwnd: HWND, state: &Rc<RefCell<EditorState>>, cmd: u16) {
                 save_project(hwnd, state, true);
             }
             CMD_OPEN => open_file(hwnd, state),
+            CMD_ABOUT => crate::win::about::show(hwnd),
             CMD_NEW_CLIPBOARD => {
                 let bm = crate::win::clipboard::read_image(hwnd);
                 match bm {

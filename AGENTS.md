@@ -35,7 +35,6 @@ Frame Zero (`frame0`) is a single-binary Windows screenshot + annotation tool: a
 ### Known gaps
 
 - Scrolling-capture stitching keeps each frame's scrollbar column, which leaves small artefacts.
-- Prompt dialogs use classic (unthemed) Win32 controls: there's no comctl v6 manifest, so EDIT cue banners don't show.
 - Auto-fill is interpolation-based (inverse-distance from the four directions + blur), not texture synthesis.
 - GDI+ PNG encode/decode goes through a temp file (`gfx/gdiplus.rs`); an in-memory IStream path was never added.
 - A new capture *replaces* the open editor's document (after a save/discard prompt if dirty); there is only one editor window.
@@ -52,6 +51,7 @@ Frame Zero (`frame0`) is a single-binary Windows screenshot + annotation tool: a
 
 - **Nightly is mandatory.** `rust-toolchain.toml` pins it; `.cargo/config.toml` uses `-Z build-std` with `panic=immediate-abort`, `location-detail=none`, `fmt-debug=none`, which stable can't satisfy. You need the `rust-src` component (`rustup component add rust-src --toolchain nightly`). The target is hardcoded to `x86_64-pc-windows-msvc`.
 - **Exit the tray before rebuilding.** The running exe is locked, and cargo fails with `failed to remove file … Access is denied`. To exit, right-click the tray icon → Exit, or `frame0.exe --cmd 199`.
+- **Resources.** `build.rs` embeds `res/frame0.rc`: the Common Controls v6 manifest (`res/frame0.manifest`, themed controls + the About box's SysLink) and `res/frame0.ico` (resource id 1) via `embed-resource` (needs the Windows SDK `rc.exe`); `win::app_icon(small)` loads it for the tray and the editor window class. The `.ico` is rendered from `res/frame0-small.svg` (a 16 px pixel-grid design, used for every size: 16–256 px) with ImageMagick, then packed as PNG-only entries by `python -I res/mkico.py res/frame0.ico 16.png 20.png … 256.png` (~16 KB; ImageMagick's own ICO writer stores BMPs and comes out larger).
 - **There are no tests.** A test runner would have to cope with `build-std` + `panic=abort`.
 
 ### Binary-size discipline
@@ -127,6 +127,7 @@ src/error.rs                Error (Hr / Win32 / Generic), Result; From<windows::
 └── win/
     ├── tray.rs             Shell_NotifyIcon, balloon, tooltip, TaskbarCreated re-add
     ├── prompt.rs           prompt::ask(owner, title, &[(label, init)]) modal input dialog
+    ├── about.rs            Help → About box (in-memory dialog template, SysLink to GitHub)
     ├── hotkey.rs           HotkeySpec, parse("Ctrl+Win+PgDn"), Register/UnregisterHotKey
     ├── clipboard.rs        write CF_DIBV5 + CF_DIB + "PNG"; read PNG then CF_DIB
     ├── dialog.rs           GetOpenFileNameW / GetSaveFileNameW

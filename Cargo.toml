@@ -2,6 +2,7 @@
 name = "frame0"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "frame0"
@@ -53,6 +54,9 @@ features = [
 # D2D point / matrix types live in windows-numerics in windows 0.61+.
 [dependencies.windows-numerics]
 version = "0.2"
+
+[build-dependencies]
+embed-resource = "3.0.12"
 
 [profile.release]
 opt-level = "z"

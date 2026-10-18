@@ -82,4 +82,4 @@ PNG / JPG export is flattened (annotations are rasterized into the base image). 
 
 ## License
 
-No license has been declared. Treat this as all-rights-reserved unless and until a license file is added.
+Copyright © 2026 Claude Henchoz. Licensed under the GNU General Public License, version 3 or later — see [LICENSE](LICENSE).

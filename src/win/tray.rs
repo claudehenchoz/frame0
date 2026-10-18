@@ -1,3 +1,20 @@
+// Frame Zero - a tiny Windows screenshot and annotation tool
+// Copyright (C) 2026 Claude Henchoz
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 use crate::error::{Error, Result};
 use crate::win::wide;
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
@@ -7,7 +24,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuRadioItem, CreatePopupMenu, DestroyMenu, GetCursorPos, HICON, HMENU,
-    IDI_APPLICATION, LoadIconW, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
     MF_STRING, PostMessageW, RegisterWindowMessageW, SetForegroundWindow, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL, WM_RBUTTONUP,
 };
@@ -31,7 +48,7 @@ fn copy_w(dst: &mut [u16], s: &str) {
 impl Tray {
     pub fn install(hwnd: HWND, tooltip: &str) -> Result<Self> {
         unsafe {
-            let hicon: HICON = LoadIconW(0, IDI_APPLICATION);
+            let hicon: HICON = crate::win::app_icon(true);
             let mut nid: NOTIFYICONDATAW = core::mem::zeroed();
             nid.cbSize = core::mem::size_of::<NOTIFYICONDATAW>() as u32;
             nid.hWnd = hwnd;
