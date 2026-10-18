@@ -14,6 +14,9 @@ mod win;
 use error::Result;
 
 fn main() -> Result<()> {
+    if app::forward_command() {
+        return Ok(());
+    }
     // Kick off the COM/DLL warm-up before any synchronous setup. The bg thread
     // races App::new — every ms it gets before App's synchronous Gfx::create
     // shaves cold-start hotkey latency.

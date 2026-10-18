@@ -1,24 +1,30 @@
-//! `.frame` project format. v1.5 binary layout:
+//! `.frame` project format. Little-endian binary layout:
 //!
 //! ```text
 //! 0..4    magic "FRAM"
-//! 4..6    u16 version = 1
+//! 4..6    u16 version (3)
 //! 6..10   u32 base_png_len
 //! 10..    base PNG bytes (encoded via GDI+; full base image)
 //! ...     u32 next_id
 //! ...     u32 next_step_value
 //! ...     u32 annotation_count
 //! ...     annotation records, each: u8 tag + variant-specific payload
+//! ...     (v3) u32 group_count, then (u32 annotation id, u32 group id) pairs
 //! ```
+//!
+//! Older versions (1, 2) are still read: v1 arrows have no bezier, v2 arrows
+//! have a quadratic control point (converted to cubic), and v1/v2 stamps are a
+//! numeric index into the original four bundled stamps.
 
-use crate::editor::annotation::{Annotation, BlurMode, Document, Point, Rect, ShapeKind};
+use crate::editor::annotation::{Annotation, BlurMode, Document, EndStyle, Point, Rect, ShapeKind, Tail};
 use crate::error::{Error, Result};
 use crate::gfx::color::Color;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::rc::Rc;
 
 const MAGIC: &[u8; 4] = b"FRAM";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 
 const TAG_ARROW: u8 = 1;
 const TAG_SHAPE: u8 = 2;
@@ -28,6 +34,8 @@ const TAG_HIGHLIGHT: u8 = 5;
 const TAG_BLUR: u8 = 6;
 const TAG_MAGNIFY: u8 = 7;
 const TAG_STAMP: u8 = 8;
+const TAG_CALLOUT: u8 = 9;
+const TAG_IMAGE: u8 = 10;
 
 pub fn save(doc: &Document, path: &str) -> Result<()> {
     let mut buf: Vec<u8> = Vec::new();
@@ -35,14 +43,18 @@ pub fn save(doc: &Document, path: &str) -> Result<()> {
     buf.extend_from_slice(&VERSION.to_le_bytes());
 
     let png = crate::gfx::gdiplus::encode_png_bytes(&doc.base)?;
-    buf.extend_from_slice(&(png.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&png);
+    write_bytes(&mut buf, &png);
 
     buf.extend_from_slice(&doc.next_id.to_le_bytes());
     buf.extend_from_slice(&doc.next_step_value.to_le_bytes());
     buf.extend_from_slice(&(doc.annotations.len() as u32).to_le_bytes());
     for a in &doc.annotations {
-        write_ann(&mut buf, a);
+        write_ann(&mut buf, a)?;
+    }
+    buf.extend_from_slice(&(doc.groups.len() as u32).to_le_bytes());
+    for (id, g) in &doc.groups {
+        buf.extend_from_slice(&id.to_le_bytes());
+        buf.extend_from_slice(&g.to_le_bytes());
     }
 
     let mut f = File::create(path).map_err(|_| Error::msg("project: create failed"))?;
@@ -62,7 +74,7 @@ pub fn load(path: &str) -> Result<Document> {
         return Err(Error::msg("not a .frame file"));
     }
     let version = r.u16()?;
-    if version != 1 && version != VERSION {
+    if version == 0 || version > VERSION {
         return Err(Error::msg("unsupported project version"));
     }
     let png_len = r.u32()? as usize;
@@ -71,86 +83,95 @@ pub fn load(path: &str) -> Result<Document> {
     let next_id = r.u32()?;
     let next_step_value = r.u32()?;
     let count = r.u32()? as usize;
-    let mut anns = Vec::with_capacity(count);
+    let mut doc = Document::new(base);
+    doc.next_id = next_id;
+    doc.next_step_value = next_step_value;
     for _ in 0..count {
-        anns.push(read_ann(&mut r, version)?);
+        doc.annotations.push(read_ann(&mut r, version)?);
     }
-    Ok(Document {
-        base,
-        annotations: anns,
-        next_id,
-        next_step_value,
-    })
+    if version >= 3 {
+        let n = r.u32()?;
+        for _ in 0..n {
+            let id = r.u32()?;
+            let g = r.u32()?;
+            doc.groups.insert(id, g);
+        }
+    }
+    // Guard against ids colliding with ones already in the file.
+    let max_id = doc.annotations.iter().map(|a| a.id()).max().unwrap_or(0);
+    doc.next_id = doc.next_id.max(max_id + 1);
+    Ok(doc)
 }
 
-fn write_ann(buf: &mut Vec<u8>, a: &Annotation) {
+fn write_ann(buf: &mut Vec<u8>, a: &Annotation) -> Result<()> {
     match a {
-        Annotation::Arrow {
-            id,
-            start,
-            end,
-            color,
-            stroke,
-            bezier,
-        } => {
+        Annotation::Arrow { id, start, end, color, stroke, bezier, head, tail, shadow } => {
             buf.push(TAG_ARROW);
             buf.extend_from_slice(&id.to_le_bytes());
             write_point(buf, *start);
             write_point(buf, *end);
             write_color(buf, *color);
             buf.extend_from_slice(&stroke.to_le_bytes());
-            // v2 extension: optional bezier control point.
             match bezier {
-                Some(p) => {
+                Some((c1, c2)) => {
                     buf.push(1);
-                    write_point(buf, *p);
+                    write_point(buf, *c1);
+                    write_point(buf, *c2);
                 }
                 None => buf.push(0),
             }
+            buf.push(head.to_u8());
+            buf.push(tail.to_u8());
+            buf.push(*shadow as u8);
         }
-        Annotation::Shape {
-            id,
-            kind,
-            bounds,
-            outline,
-            fill,
-            stroke,
-            rotation,
-        } => {
+        Annotation::Shape { id, kind, bounds, points, outline, fill, stroke, rotation, shadow } => {
             buf.push(TAG_SHAPE);
             buf.extend_from_slice(&id.to_le_bytes());
             buf.push(match kind {
                 ShapeKind::Rectangle => 0,
                 ShapeKind::Ellipse => 1,
+                ShapeKind::Polygon => 2,
             });
             write_rect(buf, *bounds);
             write_color(buf, *outline);
             write_color(buf, *fill);
             buf.extend_from_slice(&stroke.to_le_bytes());
             buf.extend_from_slice(&rotation.to_le_bytes());
+            buf.push(*shadow as u8);
+            buf.extend_from_slice(&(points.len() as u32).to_le_bytes());
+            for p in points {
+                write_point(buf, *p);
+            }
         }
-        Annotation::Text {
-            id,
-            bounds,
-            text,
-            color,
-            size,
-        } => {
+        Annotation::Callout { id, bounds, text, fill, outline, text_color, size, stroke, tails, rotation, radius, shadow } => {
+            buf.push(TAG_CALLOUT);
+            buf.extend_from_slice(&id.to_le_bytes());
+            write_rect(buf, *bounds);
+            write_str(buf, text);
+            write_color(buf, *fill);
+            write_color(buf, *outline);
+            write_color(buf, *text_color);
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&stroke.to_le_bytes());
+            buf.extend_from_slice(&(tails.len() as u32).to_le_bytes());
+            for t in tails {
+                write_point(buf, t.anchor);
+                write_point(buf, t.tip);
+            }
+            buf.extend_from_slice(&rotation.to_le_bytes());
+            buf.extend_from_slice(&radius.to_le_bytes());
+            buf.push(*shadow as u8);
+        }
+        Annotation::Text { id, bounds, text, color, size, rotation } => {
             buf.push(TAG_TEXT);
             buf.extend_from_slice(&id.to_le_bytes());
             write_rect(buf, *bounds);
             write_str(buf, text);
             write_color(buf, *color);
             buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&rotation.to_le_bytes());
         }
-        Annotation::Step {
-            id,
-            center,
-            radius,
-            value,
-            fill,
-            text,
-        } => {
+        Annotation::Step { id, center, radius, value, fill, text } => {
             buf.push(TAG_STEP);
             buf.extend_from_slice(&id.to_le_bytes());
             write_point(buf, *center);
@@ -165,30 +186,19 @@ fn write_ann(buf: &mut Vec<u8>, a: &Annotation) {
             write_rect(buf, *bounds);
             write_color(buf, *color);
         }
-        Annotation::Blur {
-            id,
-            bounds,
-            mode,
-            intensity,
-            fill,
-        } => {
+        Annotation::Blur { id, bounds, mode, intensity, fill } => {
             buf.push(TAG_BLUR);
             buf.extend_from_slice(&id.to_le_bytes());
             write_rect(buf, *bounds);
             buf.push(match mode {
                 BlurMode::Solid => 0,
                 BlurMode::Blur => 1,
+                BlurMode::Pixelate => 2,
             });
             buf.extend_from_slice(&intensity.to_le_bytes());
             write_color(buf, *fill);
         }
-        Annotation::Magnify {
-            id,
-            source,
-            display,
-            line_width,
-            color,
-        } => {
+        Annotation::Magnify { id, source, display, line_width, color } => {
             buf.push(TAG_MAGNIFY);
             buf.extend_from_slice(&id.to_le_bytes());
             write_rect(buf, *source);
@@ -196,52 +206,100 @@ fn write_ann(buf: &mut Vec<u8>, a: &Annotation) {
             buf.extend_from_slice(&line_width.to_le_bytes());
             write_color(buf, *color);
         }
-        Annotation::Stamp {
-            id,
-            asset,
-            bounds,
-            rotation,
-        } => {
+        Annotation::Stamp { id, asset, bounds, rotation } => {
             buf.push(TAG_STAMP);
             buf.extend_from_slice(&id.to_le_bytes());
-            buf.push(*asset);
+            write_str(buf, asset);
             write_rect(buf, *bounds);
             buf.extend_from_slice(&rotation.to_le_bytes());
+            // Embed user stamp pixels so the project opens anywhere.
+            let png = match crate::editor::stamps::file_bitmap(asset) {
+                Some(b) if asset.starts_with("f:") => crate::gfx::gdiplus::encode_png_bytes(&b)?,
+                _ => Vec::new(),
+            };
+            write_bytes(buf, &png);
+        }
+        Annotation::Image { id, bounds, bitmap, rotation } => {
+            buf.push(TAG_IMAGE);
+            buf.extend_from_slice(&id.to_le_bytes());
+            write_rect(buf, *bounds);
+            buf.extend_from_slice(&rotation.to_le_bytes());
+            write_bytes(buf, &crate::gfx::gdiplus::encode_png_bytes(bitmap)?);
         }
     }
+    Ok(())
 }
 
 fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
     let tag = r.u8()?;
     let id = r.u32()?;
+    let v3 = version >= 3;
     Ok(match tag {
-        TAG_ARROW => Annotation::Arrow {
-            id,
-            start: read_point(r)?,
-            end: read_point(r)?,
-            color: read_color(r)?,
-            stroke: r.f32()?,
-            bezier: if version >= 2 {
-                if r.u8()? == 1 { Some(read_point(r)?) } else { None }
+        TAG_ARROW => {
+            let start = read_point(r)?;
+            let end = read_point(r)?;
+            let color = read_color(r)?;
+            let stroke = r.f32()?;
+            let bezier = if v3 {
+                if r.u8()? == 1 { Some((read_point(r)?, read_point(r)?)) } else { None }
+            } else if version == 2 && r.u8()? == 1 {
+                // Quadratic → cubic: c1 = s + 2/3(q-s), c2 = e + 2/3(q-e).
+                let q = read_point(r)?;
+                Some((
+                    Point::new(start.x + (q.x - start.x) * 2.0 / 3.0, start.y + (q.y - start.y) * 2.0 / 3.0),
+                    Point::new(end.x + (q.x - end.x) * 2.0 / 3.0, end.y + (q.y - end.y) * 2.0 / 3.0),
+                ))
             } else {
                 None
-            },
-        },
-        TAG_SHAPE => {
-            let kind = if r.u8()? == 0 {
-                ShapeKind::Rectangle
-            } else {
-                ShapeKind::Ellipse
             };
-            Annotation::Shape {
-                id,
-                kind,
-                bounds: read_rect(r)?,
-                outline: read_color(r)?,
-                fill: read_color(r)?,
-                stroke: r.f32()?,
-                rotation: r.f32()?,
+            let (head, tail, shadow) = if v3 {
+                (EndStyle::from_u8(r.u8()?), EndStyle::from_u8(r.u8()?), r.u8()? != 0)
+            } else {
+                (EndStyle::Arrow, EndStyle::None, false)
+            };
+            Annotation::Arrow { id, start, end, color, stroke, bezier, head, tail, shadow }
+        }
+        TAG_SHAPE => {
+            let kind = match r.u8()? {
+                0 => ShapeKind::Rectangle,
+                1 => ShapeKind::Ellipse,
+                _ => ShapeKind::Polygon,
+            };
+            let bounds = read_rect(r)?;
+            let outline = read_color(r)?;
+            let fill = read_color(r)?;
+            let stroke = r.f32()?;
+            let rotation = r.f32()?;
+            let (shadow, points) = if v3 {
+                let shadow = r.u8()? != 0;
+                let n = r.u32()? as usize;
+                let mut pts = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    pts.push(read_point(r)?);
+                }
+                (shadow, pts)
+            } else {
+                (false, Vec::new())
+            };
+            Annotation::Shape { id, kind, bounds, points, outline, fill, stroke, rotation, shadow }
+        }
+        TAG_CALLOUT => {
+            let bounds = read_rect(r)?;
+            let text = read_str(r)?;
+            let fill = read_color(r)?;
+            let outline = read_color(r)?;
+            let text_color = read_color(r)?;
+            let size = r.f32()?;
+            let stroke = r.f32()?;
+            let n = r.u32()? as usize;
+            let mut tails = Vec::with_capacity(n.min(64));
+            for _ in 0..n {
+                tails.push(Tail { anchor: read_point(r)?, tip: read_point(r)? });
             }
+            let rotation = r.f32()?;
+            let radius = r.f32()?;
+            let shadow = r.u8()? != 0;
+            Annotation::Callout { id, bounds, text, fill, outline, text_color, size, stroke, tails, rotation, radius, shadow }
         }
         TAG_TEXT => Annotation::Text {
             id,
@@ -249,6 +307,7 @@ fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
             text: read_str(r)?,
             color: read_color(r)?,
             size: r.f32()?,
+            rotation: if v3 { r.f32()? } else { 0.0 },
         },
         TAG_STEP => Annotation::Step {
             id,
@@ -265,20 +324,14 @@ fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
         },
         TAG_BLUR => {
             let bounds = read_rect(r)?;
-            let mode = if r.u8()? == 0 {
-                BlurMode::Solid
-            } else {
-                BlurMode::Blur
+            let mode = match r.u8()? {
+                0 => BlurMode::Solid,
+                2 => BlurMode::Pixelate,
+                _ => BlurMode::Blur,
             };
             let intensity = r.f32()?;
             let fill = read_color(r)?;
-            Annotation::Blur {
-                id,
-                bounds,
-                mode,
-                intensity,
-                fill,
-            }
+            Annotation::Blur { id, bounds, mode, intensity, fill }
         }
         TAG_MAGNIFY => Annotation::Magnify {
             id,
@@ -287,14 +340,38 @@ fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
             line_width: r.f32()?,
             color: read_color(r)?,
         },
-        TAG_STAMP => Annotation::Stamp {
-            id,
-            asset: r.u8()?,
-            bounds: read_rect(r)?,
-            rotation: r.f32()?,
-        },
+        TAG_STAMP => {
+            if v3 {
+                let asset = read_str(r)?;
+                let bounds = read_rect(r)?;
+                let rotation = r.f32()?;
+                let n = r.u32()? as usize;
+                let png = r.take(n)?;
+                if !png.is_empty() {
+                    if let Ok(b) = crate::gfx::gdiplus::decode_bytes(png) {
+                        crate::editor::stamps::register(&asset, Rc::new(b));
+                    }
+                }
+                Annotation::Stamp { id, asset, bounds, rotation }
+            } else {
+                let idx = r.u8()?;
+                Annotation::Stamp { id, asset: crate::editor::stamps::legacy_asset(idx).to_string(), bounds: read_rect(r)?, rotation: r.f32()? }
+            }
+        }
+        TAG_IMAGE => {
+            let bounds = read_rect(r)?;
+            let rotation = r.f32()?;
+            let n = r.u32()? as usize;
+            let bitmap = Rc::new(crate::gfx::gdiplus::decode_bytes(r.take(n)?)?);
+            Annotation::Image { id, bounds, bitmap, rotation }
+        }
         _ => return Err(Error::msg("unknown annotation tag")),
     })
+}
+
+fn write_bytes(buf: &mut Vec<u8>, b: &[u8]) {
+    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    buf.extend_from_slice(b);
 }
 
 fn write_point(buf: &mut Vec<u8>, p: Point) {

@@ -1,39 +1,41 @@
 //! Hosted in-place text editor.
 //!
-//! When the Text tool commits, or the user double-clicks an existing Text
-//! annotation, we spawn a Win32 `EDIT` control as a child of the editor's
-//! **parent** (sibling of the canvas — child windows over a DXGI swap chain
-//! don't compose cleanly). The EDIT is sub-classed via `SetWindowLongPtrW`
-//! so we can capture `VK_RETURN` (commit), `VK_ESCAPE` (cancel), and
-//! `WM_KILLFOCUS` (commit on click-away).
+//! Text, Callout and Step annotations are edited with a Win32 `EDIT` control
+//! created as a child of the editor's **parent** (sibling of the canvas —
+//! child windows over a DXGI swap chain don't compose cleanly). The EDIT is
+//! sub-classed via `SetWindowLongPtrW` so we can capture `VK_RETURN`
+//! (commit), `VK_ESCAPE` (cancel), and `WM_KILLFOCUS` (commit on click-away).
+//! Ctrl+Enter inserts a newline (Text/Callout).
 //!
 //! On commit, the new text is written into the annotation via a `Mutate`
-//! command on the editor's history.
+//! command on the canvas history.
 
-use crate::editor::annotation::Annotation;
+use crate::editor::annotation::{Annotation, Rect};
+use crate::editor::canvas::TextEditReq;
 use crate::editor::history::Command;
 use crate::editor::layout::TOOLBAR_HEIGHT;
-use crate::error::Result;
 use crate::win::wide;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, FW_NORMAL,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_NORMAL,
     InvalidateRect, OUT_DEFAULT_PRECIS, VARIABLE_PITCH,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DestroyWindow, GWLP_WNDPROC, GetWindowTextLengthW,
-    GetWindowTextW, SendMessageW, SetWindowLongPtrW, WM_KEYDOWN, WM_KILLFOCUS, WM_SETFONT,
+    GetWindowTextW, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetWindowPos, SetWindowLongPtrW, WM_CHAR, WM_KEYDOWN, WM_KILLFOCUS, WM_SETFONT,
     WS_BORDER, WS_CHILD, WS_VISIBLE,
 };
 
 // EDIT control styles (not all are in windows-sys WindowsAndMessaging).
 const ES_MULTILINE: u32 = 0x0004;
 const ES_AUTOVSCROLL: u32 = 0x0040;
+const ES_CENTER: u32 = 0x0001;
 const ES_WANTRETURN: u32 = 0x1000;
+const EM_SETSEL: u32 = 0x00B1;
 
 struct EditCtx {
     parent: HWND,
@@ -41,53 +43,65 @@ struct EditCtx {
     annotation_id: u32,
     /// Original EDIT wndproc, stored so we can chain via `CallWindowProcW`.
     original_proc: isize,
-    /// Set while we're committing/cancelling so the WM_KILLFOCUS that fires
-    /// during DestroyWindow doesn't re-enter and double-commit.
-    finishing: bool,
+    font: isize,
 }
 
 thread_local! {
     static EDITS: RefCell<HashMap<HWND, EditCtx>> = RefCell::new(HashMap::new());
 }
 
-/// Spawn an EDIT child positioned at `parent_rect` (parent-relative client
-/// coordinates) over an existing empty Text annotation. The initial text is
-/// loaded from the annotation; on commit, the new text is written back via
-/// a Mutate command.
-pub fn spawn(
-    parent: HWND,
-    canvas_hwnd: HWND,
-    annotation_id: u32,
-    parent_rect: RECT,
-    initial_text: &str,
-    font_size: f32,
-) -> Result<()> {
+/// Spawn an EDIT over the annotation described by `req` (canvas-client
+/// coordinates).
+pub fn spawn_for(parent: HWND, canvas_hwnd: HWND, req: TextEditReq) {
+    let state = crate::editor::window::get_state(parent);
+    let Some(state) = state else { return };
+    let (multiline, centered) = {
+        let mut st = state.borrow_mut();
+        let kind = st.canvas.doc.get(req.id).cloned();
+        match kind {
+            Some(Annotation::Text { .. }) => {
+                st.canvas.editing = Some(req.id);
+                (true, false)
+            }
+            Some(Annotation::Callout { .. }) => (true, true),
+            Some(Annotation::Step { .. }) => (false, true),
+            _ => return,
+        }
+    };
+    unsafe { InvalidateRect(canvas_hwnd, core::ptr::null(), 0) };
     let class = wide("EDIT");
-    let text = wide(initial_text);
+    let text = wide(&req.text.replace('\n', "\r\n"));
+    let mut style = WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOVSCROLL;
+    if multiline {
+        style |= ES_MULTILINE | ES_WANTRETURN;
+    }
+    if centered {
+        style |= ES_CENTER | ES_MULTILINE;
+    }
+    let r: Rect = req.rect;
     unsafe {
         let hinst = GetModuleHandleW(core::ptr::null()) as _;
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
             text.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
-            parent_rect.left,
-            parent_rect.top,
-            (parent_rect.right - parent_rect.left).max(40),
-            (parent_rect.bottom - parent_rect.top).max(24),
+            style,
+            r.x as i32,
+            r.y as i32 + TOOLBAR_HEIGHT,
+            (r.w as i32).max(60),
+            (r.h as i32).max((req.size * 1.6) as i32).max(24),
             parent,
             0,
             hinst,
             core::ptr::null(),
         );
         if hwnd == 0 {
-            return Err(crate::error::Error::last_win32());
+            return;
         }
 
-        // Font matching the annotation's size.
-        let face = wide("Segoe UI");
+        let face = wide(crate::editor::render::FONT);
         let font = CreateFontW(
-            -font_size as i32,
+            -(req.size.max(8.0) as i32),
             0,
             0,
             0,
@@ -103,25 +117,18 @@ pub fn spawn(
             face.as_ptr(),
         );
         SendMessageW(hwnd, WM_SETFONT, font as WPARAM, 1);
+        SendMessageW(hwnd, EM_SETSEL, 0, -1);
+        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 
-        // Subclass.
         let original = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, edit_wndproc as *const () as isize);
         EDITS.with(|m| {
             m.borrow_mut().insert(
                 hwnd,
-                EditCtx {
-                    parent,
-                    canvas_hwnd,
-                    annotation_id,
-                    original_proc: original,
-                    finishing: false,
-                },
+                EditCtx { parent, canvas_hwnd, annotation_id: req.id, original_proc: original, font },
             );
         });
-
         SetFocus(hwnd);
     }
-    Ok(())
 }
 
 fn read_text(hwnd: HWND) -> String {
@@ -132,70 +139,103 @@ fn read_text(hwnd: HWND) -> String {
         }
         let mut buf = vec![0u16; (len + 1) as usize];
         let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        String::from_utf16_lossy(&buf[..n as usize])
+        String::from_utf16_lossy(&buf[..n as usize]).replace("\r\n", "\n")
     }
 }
 
 fn finish(hwnd: HWND, commit: bool) {
-    let ctx = EDITS.with(|m| m.borrow_mut().remove(&hwnd));
-    let Some(mut ctx) = ctx else { return };
-    if ctx.finishing {
+    // Read first: WM_GETTEXT is routed through the subclass, which needs the
+    // context to reach the original proc. Removing the context afterwards
+    // makes re-entrant calls (the WM_KILLFOCUS fired during DestroyWindow)
+    // no-ops.
+    if EDITS.with(|m| !m.borrow().contains_key(&hwnd)) {
         return;
     }
-    ctx.finishing = true;
+    let new_text = read_text(hwnd);
+    let ctx = EDITS.with(|m| m.borrow_mut().remove(&hwnd));
+    let Some(ctx) = ctx else { return };
 
-    if commit {
-        let new_text = read_text(hwnd);
-        let state = crate::editor::window::get_state(ctx.parent);
-        if let Some(state) = state {
-            let mut st = state.borrow_mut();
-            if let Some(idx) = st.canvas.doc.find_index(ctx.annotation_id) {
-                let before = st.canvas.doc.annotations[idx].clone();
-                let mut after = before.clone();
-                if let Annotation::Text { text, .. } = &mut after {
-                    if new_text.is_empty() {
-                        // Empty → treat as cancel and remove the annotation.
-                        let ann = st.canvas.doc.annotations.remove(idx);
-                        st.history.push(Command::Remove { index: idx, ann });
-                    } else {
+    if let Some(state) = crate::editor::window::get_state(ctx.parent) {
+        let mut st = state.borrow_mut();
+        st.canvas.editing = None;
+        let gfx = st.canvas.gfx.clone();
+        if let Some(idx) = st.canvas.doc.find_index(ctx.annotation_id) {
+            let before = st.canvas.doc.annotations[idx].clone();
+            let mut after = before.clone();
+            let mut remove = false;
+            match &mut after {
+                Annotation::Text { text, bounds, size, .. } => {
+                    if commit {
                         *text = new_text;
-                        st.canvas.doc.annotations[idx] = after.clone();
-                        st.history.push(Command::Mutate {
-                            id: ctx.annotation_id,
-                            before,
-                            after,
-                        });
                     }
-                }
-            }
-            let cv = st.canvas_hwnd;
-            drop(st);
-            unsafe { InvalidateRect(cv, core::ptr::null(), 0) };
-        }
-    } else {
-        // Cancel: remove the freshly-inserted (empty) annotation if it still
-        // has empty text, so escaping a brand-new Text click is a no-op.
-        let state = crate::editor::window::get_state(ctx.parent);
-        if let Some(state) = state {
-            let mut st = state.borrow_mut();
-            if let Some(idx) = st.canvas.doc.find_index(ctx.annotation_id) {
-                if let Annotation::Text { text, .. } = &st.canvas.doc.annotations[idx] {
                     if text.is_empty() {
-                        let ann = st.canvas.doc.annotations.remove(idx);
-                        st.history.push(Command::Remove { index: idx, ann });
+                        remove = true;
+                    } else {
+                        // Grow the box to fit the wrapped text.
+                        let (_, h) = crate::editor::render::measure_text(&gfx, text, *size, bounds.w);
+                        bounds.h = bounds.h.max(h + 2.0);
                     }
                 }
+                Annotation::Callout { text, bounds, size, .. } => {
+                    if commit {
+                        *text = new_text;
+                        let pad = crate::editor::render::CALLOUT_PAD;
+                        let (_, h) = crate::editor::render::measure_text(&gfx, text, *size, bounds.w - 2.0 * pad);
+                        bounds.h = bounds.h.max(h + 2.0 * pad);
+                    }
+                }
+                Annotation::Step { value, .. } => {
+                    let v = new_text.trim();
+                    if commit && !v.is_empty() {
+                        *value = v.chars().take(4).collect();
+                    }
+                }
+                _ => {}
             }
-            let cv = st.canvas_hwnd;
-            drop(st);
-            unsafe { InvalidateRect(cv, core::ptr::null(), 0) };
+            let c = &mut st.canvas;
+            if remove {
+                // An empty Text box (new or cleared) is dropped. If it was
+                // just created, the Insert is still on top of the undo stack:
+                // pop it rather than recording a Remove.
+                let fresh = matches!(c.history.undo.last(), Some(Command::Insert { ann, .. }) if ann.id() == ctx.annotation_id);
+                if fresh {
+                    c.history.undo.pop();
+                    c.doc.annotations.remove(idx);
+                } else {
+                    let ann = c.doc.annotations.remove(idx);
+                    c.history.push(Command::Remove { index: idx, ann });
+                }
+                c.selected.retain(|id| *id != ctx.annotation_id);
+            } else if !annotations_equal(&before, &after) {
+                c.doc.annotations[idx] = after.clone();
+                c.history.push(Command::Mutate { id: ctx.annotation_id, before, after });
+                c.dirty = true;
+            }
         }
+        drop(st);
+        unsafe { InvalidateRect(ctx.canvas_hwnd, core::ptr::null(), 0) };
+        crate::editor::window::refresh_panels(ctx.parent);
     }
 
     unsafe {
         DestroyWindow(hwnd);
+        DeleteObject(ctx.font as _);
+        SetFocus(ctx.canvas_hwnd);
     }
-    let _ = ctx.canvas_hwnd;
+}
+
+fn annotations_equal(a: &Annotation, b: &Annotation) -> bool {
+    match (a, b) {
+        (Annotation::Text { text: t1, bounds: b1, .. }, Annotation::Text { text: t2, bounds: b2, .. }) => t1 == t2 && b1 == b2,
+        (Annotation::Callout { text: t1, bounds: b1, .. }, Annotation::Callout { text: t2, bounds: b2, .. }) => t1 == t2 && b1 == b2,
+        (Annotation::Step { value: v1, .. }, Annotation::Step { value: v2, .. }) => v1 == v2,
+        _ => false,
+    }
+}
+
+/// True while an in-place editor is open (used to avoid stealing keys).
+pub fn active() -> bool {
+    EDITS.with(|m| !m.borrow().is_empty())
 }
 
 unsafe extern "system" fn edit_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -206,8 +246,8 @@ unsafe extern "system" fn edit_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
     unsafe {
         match msg {
             WM_KEYDOWN => {
-                let vk = w as u32;
-                if vk == VK_RETURN as u32 {
+                let vk = w as u16;
+                if vk == VK_RETURN {
                     let ctrl = (windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
                         windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL as i32,
                     ) as u16
@@ -217,14 +257,23 @@ unsafe extern "system" fn edit_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                         finish(hwnd, true);
                         return 0;
                     }
-                    // Ctrl+Enter inserts a newline — let it through.
-                } else if vk == VK_ESCAPE as u32 {
+                    // Ctrl+Enter inserts a newline: feed the EDIT a CR.
+                    let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
+                        core::mem::transmute(original);
+                    return CallWindowProcW(Some(proc), hwnd, WM_CHAR, 0x0D, 0);
+                } else if vk == VK_ESCAPE {
                     finish(hwnd, false);
                     return 0;
                 }
             }
+            WM_CHAR => {
+                // Swallow the CR/ESC chars that follow a commit/cancel keydown,
+                // and the Ctrl+Enter LF.
+                if w == 0x0D || w == 0x1B || w == 0x0A {
+                    return 0;
+                }
+            }
             WM_KILLFOCUS => {
-                // Click-away → commit. `finish` guards re-entry.
                 finish(hwnd, true);
                 return 0;
             }
@@ -236,17 +285,3 @@ unsafe extern "system" fn edit_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
     }
 }
 
-/// Map a document-space `Rect` to a parent-window-relative `RECT`. The canvas
-/// child sits at `(0, TOOLBAR_HEIGHT)` within the parent's client area.
-pub fn doc_rect_to_parent(view_scale: f32, view_offset: (f32, f32), bounds: crate::editor::annotation::Rect) -> RECT {
-    let left = view_offset.0 + bounds.x * view_scale;
-    let top = view_offset.1 + bounds.y * view_scale + TOOLBAR_HEIGHT as f32;
-    let right = left + bounds.w * view_scale;
-    let bottom = top + bounds.h * view_scale;
-    RECT {
-        left: left as i32,
-        top: top as i32,
-        right: right as i32,
-        bottom: bottom as i32,
-    }
-}

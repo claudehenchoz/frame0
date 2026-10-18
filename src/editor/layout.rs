@@ -5,7 +5,7 @@
 use windows_sys::Win32::Foundation::RECT;
 
 pub const TOOLBAR_HEIGHT: i32 = 44;
-pub const PROPERTY_WIDTH: i32 = 200;
+pub const PROPERTY_WIDTH: i32 = 224;
 
 pub fn toolbar_rect(client: &RECT) -> RECT {
     RECT {

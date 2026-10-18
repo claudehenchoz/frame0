@@ -1,9 +1,10 @@
 pub mod annotation;
 pub mod canvas;
-pub mod flatten;
 pub mod history;
 pub mod layout;
+pub mod pixels;
 pub mod property;
+pub mod render;
 pub mod stamps;
 pub mod text_edit;
 pub mod toolbar;

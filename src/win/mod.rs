@@ -3,6 +3,7 @@ pub mod com;
 pub mod dialog;
 pub mod dpi;
 pub mod hotkey;
+pub mod prompt;
 pub mod tray;
 pub mod window;
 

@@ -1,17 +1,20 @@
 //! D2D-rendered canvas child window.
 //!
-//! The canvas owns its DXGI swap chain and renders entirely with Direct2D 1.1
-//! through `ID2D1DeviceContext`. The device context is shared from
-//! `crate::gfx::d2d::D2D` (one per process, single-threaded apartment).
-//!
-//! Per-frame: `BeginDraw` → clear → `SetTransform` (scale + translate) →
-//! `DrawBitmap(base)` → walk annotations → preview drag → handles → `EndDraw` →
-//! `Present(1, 0)`. `EndDraw` is wrapped with a one-shot retry on
-//! `D2DERR_RECREATE_TARGET` (device loss).
+//! The canvas owns its DXGI swap chain and renders through `Renderer`
+//! (`editor/render.rs`) using the process-wide `ID2D1DeviceContext`. It also
+//! owns the interaction state machine: object selection (click, Shift-click,
+//! marquee), move / resize / rotate handles, kind-specific edit points
+//! (arrow endpoints + bezier handles, polygon vertices, callout tails,
+//! magnifier source), the drawing tools, the pixel Selection tool and the
+//! Cut-out tool. Every document change goes through `History` as a command.
 
-use crate::editor::annotation::{Annotation, BlurMode, Document, Point, Rect, ShapeKind};
-use crate::editor::history::Command;
-use crate::editor::tools::{Drag, Tool, ToolStyle};
+use crate::editor::annotation::{
+    Annotation, AnnotationId, Document, Part, Point, Rect, ShapeKind, Tail,
+};
+use crate::editor::history::{self, Command, History};
+use crate::editor::pixels::{self, Effect, PixelSel, SelShape};
+use crate::editor::render::{self, RenderOpts, Renderer, identity, rect_f, v2};
+use crate::editor::tools::{self, Tool, ToolStyle};
 use crate::error::{Error, Result};
 use crate::gfx::Gfx;
 use crate::gfx::bitmap::Bitmap;
@@ -19,65 +22,101 @@ use crate::gfx::color::Color;
 use crate::gfx::d2d::{color_f, upload_bitmap};
 use std::rc::Rc;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND as WinHWND};
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_FIGURE_BEGIN_FILLED,
-    D2D1_FIGURE_END_CLOSED, D2D_RECT_F,
-};
+use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1GaussianBlur, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
-    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_PRIMITIVE_BLEND, D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
-    D2D1_PROPERTY_TYPE_FLOAT, ID2D1Bitmap1, ID2D1Brush, ID2D1Effect, ID2D1Image,
-    ID2D1SolidColorBrush,
+    D2D1_BITMAP_BRUSH_PROPERTIES1, D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_ELLIPSE,
+    D2D1_EXTEND_MODE_WRAP, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LINE_JOIN_MITER,
+    D2D1_STROKE_STYLE_PROPERTIES1, ID2D1Bitmap1, ID2D1BitmapBrush1, ID2D1Brush, ID2D1DeviceContext,
+    ID2D1Image, ID2D1StrokeStyle,
 };
-use windows_numerics::{Matrix3x2, Vector2};
-use windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL;
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
 use windows::core::Interface;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_numerics::Matrix3x2;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE,
-    VK_Y, VK_Z,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_ESCAPE, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetParent, IDC_ARROW, LoadCursorW, RegisterClassExW,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SIZE,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, GetParent, HTCLIENT, IDC_ARROW, IDC_CROSS, IDC_HAND,
+    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, LoadCursorW, PostMessageW,
+    RegisterClassExW, SetCursor, WM_CAPTURECHANGED, WM_COMMAND, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WNDCLASSEXW, CS_DBLCLKS,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 const CLASS_NAME: &str = "frame.editor.canvas";
-const HANDLE_HALF: f32 = 4.0;
-const BEZIER_HANDLE_RADIUS: f32 = 6.0;
-const BRUSH_CACHE: usize = 8;
+/// Handle half-size in screen pixels.
+const HANDLE: f32 = 5.0;
+const ROT_OFFSET: f32 = 28.0;
+const ACCENT: Color = Color::rgb(0x3D, 0x8B, 0xFF);
+const MARGIN: f32 = 24.0;
 
-struct HandleDrag {
-    id: u32,
-    original_ann: Annotation,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Handle {
+    Frame(u8),
+    Rotate,
+    Edit(usize),
+}
+
+enum Gesture {
+    Idle,
+    Pan { last: (f32, f32) },
+    Create { start: Point, cur: Point },
+    Polygon { pts: Vec<Point>, hover: Point },
+    Freehand { pts: Vec<Point> },
+    Marquee { start: Point, cur: Point, additive: bool },
+    Move { start: Point, last: Point, part: Part, originals: Vec<Annotation>, moved: bool },
+    Resize { handle: u8, frame0: Rect, rot: f32, originals: Vec<Annotation> },
+    Rotate { center: Point, original: Annotation, angle0: f32 },
+    EditPoint { idx: usize, original: Annotation },
+    SelRect { start: Point, cur: Point },
+    Band { start: Point, cur: Point },
+    PendingLift { start: Point },
+}
+
+/// Text-edit request handed back to the wndproc (spawned after the borrow ends).
+pub struct TextEditReq {
+    pub id: AnnotationId,
+    pub rect: Rect,
+    pub text: String,
+    pub size: f32,
 }
 
 pub struct Canvas {
     pub gfx: Rc<Gfx>,
     pub doc: Document,
-    pub selected: Option<u32>,
+    pub history: History,
+    pub selected: Vec<AnnotationId>,
+    pub pixel_sel: Option<PixelSel>,
     pub view_scale: f32,
     pub view_offset: (f32, f32),
     pub size: (u32, u32),
     pub active_tool: Tool,
     pub style: ToolStyle,
-    pub drag: Option<Drag>,
-    pub move_anchor: Option<Point>,
-    handle_drag: Option<HandleDrag>,
+    pub editing: Option<AnnotationId>,
+    pub dirty: bool,
+    pub hwnd: HWND,
+    gesture: Gesture,
+    cursor: *const u16,
+    space_down: bool,
+    clip: Vec<Annotation>,
+    clip_seq: u32,
+    /// True once the user zooms/pans; until then resizes re-fit the image.
+    user_view: bool,
 
-    // D2D resources. Created in `attach`; rebuilt on device loss.
+    renderer: Renderer,
     swap: Option<IDXGISwapChain1>,
     target: Option<ID2D1Bitmap1>,
-    base: Option<ID2D1Bitmap1>,
-    brushes: Vec<(Color, ID2D1SolidColorBrush)>,
-    gaussian: Option<ID2D1Effect>,
-    /// Bundled-stamp bitmaps, lazily decoded on first draw.
-    stamps: Vec<Option<ID2D1Bitmap1>>,
+    checker: Option<ID2D1BitmapBrush1>,
+    dash: Option<ID2D1StrokeStyle>,
+}
+
+fn key_down(vk: u16) -> bool {
+    unsafe { (GetKeyState(vk as i32) as u16 & 0x8000) != 0 }
 }
 
 impl Canvas {
@@ -85,35 +124,38 @@ impl Canvas {
         Ok(Self {
             gfx,
             doc,
-            selected: None,
+            history: History::new(),
+            selected: Vec::new(),
+            pixel_sel: None,
             view_scale: 1.0,
-            view_offset: (24.0, 12.0),
+            view_offset: (MARGIN, MARGIN),
             size: (1024, 768),
             active_tool: Tool::Arrow,
             style: ToolStyle::default(),
-            drag: None,
-            move_anchor: None,
-            handle_drag: None,
+            editing: None,
+            dirty: false,
+            hwnd: 0,
+            gesture: Gesture::Idle,
+            cursor: IDC_ARROW,
+            space_down: false,
+            clip: Vec::new(),
+            clip_seq: 0,
+            user_view: false,
+            renderer: Renderer::new(),
             swap: None,
             target: None,
-            base: None,
-            brushes: Vec::new(),
-            gaussian: None,
-            stamps: vec![None; crate::editor::stamps::COUNT],
+            checker: None,
+            dash: None,
         })
     }
 
-    /// Attach to the canvas child HWND. Creates the swap chain and renders
-    /// the base image into a D2D bitmap.
     pub fn attach(&mut self, hwnd: HWND, w: u32, h: u32) -> Result<()> {
+        self.hwnd = hwnd;
         self.size = (w.max(1), h.max(1));
-        let (swap, target) = self
-            .gfx
-            .d2d
-            .create_swapchain_target(WinHWND(hwnd as *mut _), self.size.0, self.size.1)?;
+        let (swap, target) = self.gfx.d2d.create_swapchain_target(WinHWND(hwnd as *mut _), self.size.0, self.size.1)?;
         self.swap = Some(swap);
         self.target = Some(target);
-        self.upload_base()?;
+        self.zoom_fit();
         Ok(())
     }
 
@@ -123,9 +165,13 @@ impl Canvas {
             return Ok(());
         }
         self.size = new;
+        if !self.user_view {
+            self.zoom_fit();
+        } else {
+            self.clamp_view();
+        }
         let Some(swap) = self.swap.as_ref() else { return Ok(()) };
         unsafe {
-            // Must drop the bound target bitmap before ResizeBuffers.
             self.target = None;
             self.gfx.d2d.context.SetTarget(None);
             swap.ResizeBuffers(
@@ -142,21 +188,87 @@ impl Canvas {
 
     pub fn replace_document(&mut self, doc: Document) -> Result<()> {
         self.doc = doc;
-        self.selected = None;
-        self.upload_base()
-    }
-
-    fn upload_base(&mut self) -> Result<()> {
-        let bm = upload_bitmap(&self.gfx.d2d.context, &self.doc.base)?;
-        self.base = Some(bm);
+        self.selected.clear();
+        self.pixel_sel = None;
+        self.gesture = Gesture::Idle;
+        self.history.clear();
+        self.dirty = false;
+        self.zoom_fit();
         Ok(())
     }
 
-    /// Render one frame. On device loss (`D2DERR_RECREATE_TARGET`) the canvas
-    /// drops its device-bound resources and skips this frame; the next
-    /// `attach` (called by the canvas wndproc when it sees `swap.is_none()`)
-    /// rebuilds them. A perfect recovery would re-attach in-place; that's a
-    /// v2.1 task.
+    // ---- view ----
+
+    pub fn world(&self) -> Matrix3x2 {
+        Matrix3x2 {
+            M11: self.view_scale,
+            M12: 0.0,
+            M21: 0.0,
+            M22: self.view_scale,
+            M31: self.view_offset.0,
+            M32: self.view_offset.1,
+        }
+    }
+
+    pub fn screen_to_doc(&self, x: f32, y: f32) -> Point {
+        Point::new((x - self.view_offset.0) / self.view_scale, (y - self.view_offset.1) / self.view_scale)
+    }
+
+    pub fn doc_to_screen(&self, p: Point) -> Point {
+        Point::new(self.view_offset.0 + p.x * self.view_scale, self.view_offset.1 + p.y * self.view_scale)
+    }
+
+    pub fn zoom_fit(&mut self) {
+        let (cw, ch) = (self.size.0 as f32, self.size.1 as f32);
+        let (w, h) = (self.doc.base.width as f32, self.doc.base.height as f32);
+        let s = ((cw - 2.0 * MARGIN) / w).min((ch - 2.0 * MARGIN) / h).min(1.0).max(0.05);
+        self.view_scale = s;
+        self.view_offset = ((cw - w * s) * 0.5, (ch - h * s) * 0.5);
+        self.user_view = false;
+        self.clamp_view();
+    }
+
+    /// Zoom to `scale` keeping the document point under screen `(sx, sy)` fixed.
+    pub fn zoom_to(&mut self, scale: f32, sx: f32, sy: f32) {
+        let scale = scale.clamp(0.05, 32.0);
+        let p = self.screen_to_doc(sx, sy);
+        self.view_scale = scale;
+        self.view_offset = (sx - p.x * scale, sy - p.y * scale);
+        self.user_view = true;
+        self.clamp_view();
+    }
+
+    pub fn zoom_step(&mut self, dir: f32) {
+        let steps = [0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0];
+        let cur = self.view_scale;
+        let next = if dir > 0.0 {
+            steps.iter().copied().find(|s| *s > cur * 1.01).unwrap_or(16.0)
+        } else {
+            steps.iter().rev().copied().find(|s| *s < cur * 0.99).unwrap_or(0.1)
+        };
+        self.zoom_to(next, self.size.0 as f32 * 0.5, self.size.1 as f32 * 0.5);
+    }
+
+    fn clamp_view(&mut self) {
+        let (cw, ch) = (self.size.0 as f32, self.size.1 as f32);
+        let w = self.doc.base.width as f32 * self.view_scale;
+        let h = self.doc.base.height as f32 * self.view_scale;
+        let fix = |off: f32, content: f32, view: f32| {
+            if content + 2.0 * MARGIN <= view {
+                (view - content) * 0.5
+            } else {
+                off.min(MARGIN).max(view - content - MARGIN)
+            }
+        };
+        self.view_offset = (fix(self.view_offset.0, w, cw), fix(self.view_offset.1, h, ch));
+    }
+
+    fn tol(&self) -> f32 {
+        4.0 / self.view_scale
+    }
+
+    // ---- rendering ----
+
     pub fn render(&mut self) -> Result<()> {
         if self.target.is_none() || self.swap.is_none() {
             return Ok(());
@@ -166,11 +278,13 @@ impl Canvas {
             Err(Error::Hr(h)) if h == D2DERR_RECREATE_TARGET.0 => {
                 self.swap = None;
                 self.target = None;
-                self.base = None;
-                self.brushes.clear();
-                self.gaussian = None;
-                for s in &mut self.stamps {
-                    *s = None;
+                self.checker = None;
+                self.dash = None;
+                self.renderer.clear();
+                // Rebuild in place so the next paint works.
+                if self.hwnd != 0 {
+                    let (w, h) = self.size;
+                    let _ = self.attach(self.hwnd, w, h);
                 }
                 Ok(())
             }
@@ -178,83 +292,70 @@ impl Canvas {
         }
     }
 
-    fn render_inner(&mut self) -> Result<()> {
-        let ctx = self.gfx.d2d.context.clone();
-        let target = self.target.as_ref().ok_or(Error::msg("no D2D target"))?;
-        unsafe {
-            let target_img: ID2D1Image = target.cast()?;
-            ctx.SetTarget(Some(&target_img));
-            ctx.BeginDraw();
-            ctx.Clear(Some(&color_f(Color::rgb(0x1A, 0x1B, 0x1D))));
-
-            // Document-space transform.
-            let m = Matrix3x2 {
-                M11: self.view_scale,
-                M12: 0.0,
-                M21: 0.0,
-                M22: self.view_scale,
-                M31: self.view_offset.0,
-                M32: self.view_offset.1,
-            };
-            ctx.SetTransform(&m);
-
-            // Base image.
-            if let Some(base) = &self.base {
-                let dest = D2D_RECT_F {
-                    left: 0.0,
-                    top: 0.0,
-                    right: self.doc.base.width as f32,
-                    bottom: self.doc.base.height as f32,
-                };
-                let base_bm: windows::Win32::Graphics::Direct2D::ID2D1Bitmap = base.cast()?;
-                ctx.DrawBitmap(
-                    &base_bm,
-                    Some(&dest),
-                    1.0,
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    None,
-                    None,
-                );
-            }
-
-            // Annotations.
-            let annotations = self.doc.annotations.clone();
-            for ann in &annotations {
-                self.draw_annotation(&ctx, ann)?;
-            }
-
-            // Preview drag.
-            if let Some(drag) = self.drag {
-                self.draw_preview(&ctx, drag)?;
-            }
-
-            // Selection handles.
-            if let Some(sel) = self.selected {
-                if let Some(i) = self.doc.find_index(sel) {
-                    let bb = self.doc.annotations[i].bounding_box();
-                    self.draw_handles(&ctx, bb)?;
-                    // Bezier control-point handle for selected bezier arrows.
-                    if let Annotation::Arrow { bezier: Some(cp), .. } = &self.doc.annotations[i] {
-                        self.draw_bezier_handle(&ctx, *cp)?;
-                    }
+    fn ensure_ui_resources(&mut self, ctx: &ID2D1DeviceContext) -> Result<()> {
+        if self.checker.is_none() {
+            let mut bm = Bitmap::new(16, 16);
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    let v = if (x / 8 + y / 8) % 2 == 0 { 0xFF } else { 0xD8 };
+                    let i = ((y * 16 + x) * 4) as usize;
+                    bm.bgra[i..i + 4].copy_from_slice(&[v, v, v, 0xFF]);
                 }
             }
-
-            // Reset transform; EndDraw.
-            let identity = Matrix3x2 {
-                M11: 1.0,
-                M12: 0.0,
-                M21: 0.0,
-                M22: 1.0,
-                M31: 0.0,
-                M32: 0.0,
+            let up = upload_bitmap(ctx, &bm)?;
+            let props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                extendModeX: D2D1_EXTEND_MODE_WRAP,
+                extendModeY: D2D1_EXTEND_MODE_WRAP,
+                interpolationMode: D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
             };
-            ctx.SetTransform(&identity);
+            self.checker = Some(unsafe { ctx.CreateBitmapBrush(&up, Some(&props), None)? });
+        }
+        if self.dash.is_none() {
+            let props = D2D1_STROKE_STYLE_PROPERTIES1 {
+                startCap: D2D1_CAP_STYLE_FLAT,
+                endCap: D2D1_CAP_STYLE_FLAT,
+                dashCap: D2D1_CAP_STYLE_FLAT,
+                lineJoin: D2D1_LINE_JOIN_MITER,
+                miterLimit: 10.0,
+                dashStyle: D2D1_DASH_STYLE_DASH,
+                dashOffset: 0.0,
+                transformType: windows::Win32::Graphics::Direct2D::D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+            };
+            self.dash = Some(unsafe { self.gfx.d2d.factory.CreateStrokeStyle(&props, None)?.into() });
+        }
+        Ok(())
+    }
 
-            let mut tag1 = 0u64;
-            let mut tag2 = 0u64;
-            ctx.EndDraw(Some(&mut tag1), Some(&mut tag2))?;
+    fn render_inner(&mut self) -> Result<()> {
+        let gfx = self.gfx.clone();
+        let ctx = gfx.d2d.context.clone();
+        let target = self.target.clone().ok_or(Error::msg("no D2D target"))?;
+        self.ensure_ui_resources(&ctx)?;
+        let world = self.world();
+        unsafe {
+            let target_img: ID2D1Image = target.cast()?;
+            ctx.SetTarget(&target_img);
+            ctx.BeginDraw();
+            ctx.Clear(Some(&color_f(Color::rgb(0x16, 0x17, 0x19))));
+            ctx.SetTransform(&world);
+            let page = self.doc.canvas_rect();
+            if let Some(ch) = &self.checker {
+                let b: ID2D1Brush = ch.cast()?;
+                ctx.SetTransform(&identity());
+                let s0 = self.doc_to_screen(Point::new(0.0, 0.0));
+                let s1 = self.doc_to_screen(Point::new(page.w, page.h));
+                ctx.FillRectangle(&D2D_RECT_F { left: s0.x, top: s0.y, right: s1.x, bottom: s1.y }, &b);
+                ctx.SetTransform(&world);
+            }
+        }
+        let r = self.renderer.draw_document(&gfx, &ctx, &self.doc, &world, RenderOpts { secure: false, skip: self.editing });
+        let r = r.and_then(|_| self.draw_overlay(&gfx, &ctx));
+        unsafe {
+            ctx.SetTransform(&identity());
+            let end = ctx.EndDraw(None, None);
             ctx.SetTarget(None);
+            r?;
+            end?;
         }
         if let Some(swap) = &self.swap {
             self.gfx.d2d.present(swap);
@@ -262,587 +363,1115 @@ impl Canvas {
         Ok(())
     }
 
-    fn brush(&mut self, color: Color) -> Result<ID2D1SolidColorBrush> {
-        if let Some(idx) = self.brushes.iter().position(|(c, _)| *c == color) {
-            return Ok(self.brushes[idx].1.clone());
-        }
-        let cf = color_f(color);
-        let brush = unsafe { self.gfx.d2d.context.CreateSolidColorBrush(&cf, None)? };
-        if self.brushes.len() >= BRUSH_CACHE {
-            self.brushes.remove(0);
-        }
-        self.brushes.push((color, brush.clone()));
-        Ok(brush)
-    }
+    /// Selection handles, gesture previews, pixel-selection outline.
+    fn draw_overlay(&mut self, gfx: &Gfx, ctx: &ID2D1DeviceContext) -> Result<()> {
+        let world = self.world();
+        let accent = self.renderer.brush(ctx, ACCENT)?;
+        let white = self.renderer.brush(ctx, Color::WHITE)?;
+        let black = self.renderer.brush(ctx, Color::rgb(0x10, 0x10, 0x10))?;
+        let dash = self.dash.clone();
 
-    fn draw_annotation(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        ann: &Annotation,
-    ) -> Result<()> {
-        match ann {
-            Annotation::Arrow { start, end, color, stroke, bezier, .. } => {
-                self.draw_arrow(ctx, *start, *end, *color, *stroke, *bezier)
-            }
-            Annotation::Shape { kind, bounds, outline, fill, stroke, .. } => {
-                self.draw_shape(ctx, *kind, *bounds, *outline, *fill, *stroke)
-            }
-            Annotation::Text { bounds, text, color, size, .. } => {
-                self.draw_text(ctx, *bounds, text, *color, *size)
-            }
-            Annotation::Step { center, radius, value, fill, text, .. } => {
-                self.draw_step(ctx, *center, *radius, value, *fill, *text)
-            }
-            Annotation::Highlighter { bounds, color, .. } => {
-                self.draw_highlight(ctx, *bounds, *color)
-            }
-            Annotation::Blur { bounds, mode, fill, intensity, .. } => match mode {
-                BlurMode::Solid => self.draw_solid(ctx, *bounds, *fill),
-                BlurMode::Blur => self.draw_blur(ctx, *bounds, *intensity),
-            },
-            Annotation::Magnify { source, display, line_width, color, .. } => {
-                self.draw_magnify(ctx, *source, *display, *line_width, *color)
-            }
-            Annotation::Stamp { asset, bounds, .. } => {
-                self.draw_stamp(ctx, *asset, *bounds)
-            }
-        }
-    }
-
-    fn draw_arrow(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        start: Point,
-        end: Point,
-        color: Color,
-        stroke: f32,
-        bezier: Option<Point>,
-    ) -> Result<()> {
-        let brush = self.brush(color)?;
-        let brush_iface: ID2D1Brush = brush.cast()?;
-
-        // Direction at the head end — used to size and orient the arrow head.
-        // For straight arrows this is start→end; for bezier arrows we use the
-        // tangent at t=1, which is `2 * (end - control)` for a quadratic.
-        let (tdx, tdy) = if let Some(b) = bezier {
-            (end.x - b.x, end.y - b.y)
-        } else {
-            (end.x - start.x, end.y - start.y)
-        };
-        let tlen = (tdx * tdx + tdy * tdy).sqrt().max(1.0);
-        let ux = tdx / tlen;
-        let uy = tdy / tlen;
-        let head = stroke * 4.0 + 6.0;
-        let shaft_ex = end.x - ux * head * 0.6;
-        let shaft_ey = end.y - uy * head * 0.6;
-
-        unsafe {
-            if let Some(b) = bezier {
-                // Quadratic-bezier shaft via path geometry.
-                let geom = self.gfx.d2d.factory.CreatePathGeometry()?;
-                let sink = geom.Open()?;
-                sink.BeginFigure(
-                    Vector2 { X: start.x, Y: start.y },
-                    windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_HOLLOW,
-                );
-                let segs = [windows::Win32::Graphics::Direct2D::D2D1_QUADRATIC_BEZIER_SEGMENT {
-                    point1: Vector2 { X: b.x, Y: b.y },
-                    point2: Vector2 { X: shaft_ex, Y: shaft_ey },
-                }];
-                sink.AddQuadraticBeziers(&segs);
-                sink.EndFigure(
-                    windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_OPEN,
-                );
-                sink.Close()?;
-                ctx.DrawGeometry(&geom, &brush_iface, stroke, None);
-            } else {
-                ctx.DrawLine(
-                    Vector2 { X: start.x, Y: start.y },
-                    Vector2 { X: shaft_ex, Y: shaft_ey },
-                    &brush_iface,
-                    stroke,
-                    None,
-                );
-            }
-        }
-
-        // Head triangle as filled path geometry.
-        let ortho_x = -uy;
-        let ortho_y = ux;
-        let p1 = Vector2 { X: end.x, Y: end.y };
-        let p2 = Vector2 {
-            X: end.x - ux * head + ortho_x * head * 0.5,
-            Y: end.y - uy * head + ortho_y * head * 0.5,
-        };
-        let p3 = Vector2 {
-            X: end.x - ux * head - ortho_x * head * 0.5,
-            Y: end.y - uy * head - ortho_y * head * 0.5,
-        };
-
-        let geom = unsafe { self.gfx.d2d.factory.CreatePathGeometry()? };
-        unsafe {
-            let sink = geom.Open()?;
-            sink.BeginFigure(p1, D2D1_FIGURE_BEGIN_FILLED);
-            sink.AddLine(p2);
-            sink.AddLine(p3);
-            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            sink.Close()?;
-            ctx.FillGeometry(&geom, &brush_iface, None);
-        }
-        Ok(())
-    }
-
-    fn draw_shape(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        kind: ShapeKind,
-        bounds: Rect,
-        outline: Color,
-        fill: Color,
-        stroke: f32,
-    ) -> Result<()> {
-        let outline_brush: ID2D1Brush = self.brush(outline)?.cast()?;
-        let fill_brush = if fill.a > 0 {
-            Some(self.brush(fill)?.cast::<ID2D1Brush>()?)
-        } else {
-            None
-        };
-        unsafe {
-            match kind {
-                ShapeKind::Rectangle => {
-                    let r = D2D_RECT_F {
-                        left: bounds.x,
-                        top: bounds.y,
-                        right: bounds.x + bounds.w,
-                        bottom: bounds.y + bounds.h,
-                    };
-                    if let Some(fb) = &fill_brush {
-                        ctx.FillRectangle(&r, fb);
+        // Gesture previews (document space).
+        unsafe { ctx.SetTransform(&world) };
+        match &self.gesture {
+            Gesture::Create { start, cur } => {
+                let end = tools::constrain(self.active_tool, *start, *cur, key_down(VK_SHIFT));
+                if let Some(a) = tools::create_from_drag(self.active_tool, &self.style, *start, end, &self.doc) {
+                    let base = self.renderer.base_bitmap(ctx, &self.doc)?;
+                    if matches!(a, Annotation::Text { .. }) {
+                        let r = a.frame();
+                        unsafe { ctx.DrawRectangle(&rect_f(r), &accent, 1.0 / self.view_scale, dash.as_ref()) };
+                    } else {
+                        self.renderer.draw_annotation(gfx, ctx, &self.doc, &base, &a, &world, RenderOpts::default())?;
                     }
-                    ctx.DrawRectangle(&r, &outline_brush, stroke, None);
                 }
-                ShapeKind::Ellipse => {
-                    let cx = bounds.x + bounds.w * 0.5;
-                    let cy = bounds.y + bounds.h * 0.5;
-                    let e = D2D1_ELLIPSE {
-                        point: Vector2 { X: cx, Y: cy },
-                        radiusX: bounds.w * 0.5,
-                        radiusY: bounds.h * 0.5,
-                    };
-                    if let Some(fb) = &fill_brush {
-                        ctx.FillEllipse(&e, fb);
+            }
+            Gesture::Polygon { pts, hover } => {
+                let mut all = pts.clone();
+                all.push(*hover);
+                if self.active_tool == Tool::Polygon {
+                    let ob = self.renderer.brush(ctx, self.style.color)?;
+                    for w in all.windows(2) {
+                        unsafe { ctx.DrawLine(v2(w[0]), v2(w[1]), &ob, self.style.stroke, None) };
                     }
-                    ctx.DrawEllipse(&e, &outline_brush, stroke, None);
+                } else {
+                    for w in all.windows(2) {
+                        unsafe {
+                            ctx.DrawLine(v2(w[0]), v2(w[1]), &black, 1.0 / self.view_scale, None);
+                            ctx.DrawLine(v2(w[0]), v2(w[1]), &white, 1.0 / self.view_scale, dash.as_ref());
+                        }
+                    }
+                }
+                if let Some(first) = pts.first() {
+                    let r = 5.0 / self.view_scale;
+                    unsafe { ctx.DrawEllipse(&D2D1_ELLIPSE { point: v2(*first), radiusX: r, radiusY: r }, &accent, 1.5 / self.view_scale, None) };
+                }
+            }
+            Gesture::Freehand { pts } => {
+                for w in pts.windows(2) {
+                    unsafe {
+                        ctx.DrawLine(v2(w[0]), v2(w[1]), &black, 1.0 / self.view_scale, None);
+                        ctx.DrawLine(v2(w[0]), v2(w[1]), &white, 1.0 / self.view_scale, dash.as_ref());
+                    }
+                }
+            }
+            Gesture::Marquee { start, cur, .. } => {
+                let r = Rect::from_points(*start, *cur);
+                let fill = self.renderer.brush(ctx, Color::rgba(0x3D, 0x8B, 0xFF, 0x30))?;
+                unsafe {
+                    ctx.FillRectangle(&rect_f(r), &fill);
+                    ctx.DrawRectangle(&rect_f(r), &accent, 1.0 / self.view_scale, None);
+                }
+            }
+            Gesture::SelRect { start, cur } => {
+                let end = tools::constrain(Tool::Select, *start, *cur, key_down(VK_SHIFT));
+                let sel = PixelSel::from_rect(self.style.sel_shape, Rect::from_points(*start, end));
+                self.draw_ants(ctx, &sel.outline, &black, &white, dash.as_ref())?;
+            }
+            Gesture::Band { start, cur } => {
+                let page = self.doc.canvas_rect();
+                let band = if self.style.cut_horizontal {
+                    let (a, b) = (start.y.min(cur.y), start.y.max(cur.y));
+                    Rect { x: page.x, y: a, w: page.w, h: b - a }
+                } else {
+                    let (a, b) = (start.x.min(cur.x), start.x.max(cur.x));
+                    Rect { x: a, y: page.y, w: b - a, h: page.h }
+                };
+                let fill = self.renderer.brush(ctx, Color::rgba(0xE5, 0x3E, 0x3E, 0x50))?;
+                let red = self.renderer.brush(ctx, Color::rgb(0xE5, 0x3E, 0x3E))?;
+                unsafe {
+                    ctx.FillRectangle(&rect_f(band), &fill);
+                    ctx.DrawRectangle(&rect_f(band), &red, 1.5 / self.view_scale, dash.as_ref());
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(sel) = &self.pixel_sel {
+            let outline = sel.outline.clone();
+            self.draw_ants(ctx, &outline, &black, &white, dash.as_ref())?;
+            if sel.inverted {
+                let page = self.doc.canvas_rect();
+                unsafe {
+                    ctx.DrawRectangle(&rect_f(page), &black, 1.0 / self.view_scale, None);
+                    ctx.DrawRectangle(&rect_f(page), &white, 1.0 / self.view_scale, dash.as_ref());
+                }
+            }
+        }
+
+        // Selection frames + handles, in screen space.
+        unsafe { ctx.SetTransform(&identity()) };
+        let sel: Vec<Annotation> = self.selected.iter().filter_map(|id| self.doc.get(*id).cloned()).collect();
+        for a in &sel {
+            let f = a.frame();
+            let c = f.center();
+            let r = a.rotation();
+            let pts: Vec<Point> = f.corners().iter().map(|p| self.doc_to_screen(p.rotated(c, r))).collect();
+            if a.has_frame() {
+                for i in 0..4 {
+                    unsafe { ctx.DrawLine(v2(pts[i]), v2(pts[(i + 1) % 4]), &accent, 1.0, None) };
+                }
+            }
+            if let Annotation::Magnify { source, .. } = a {
+                let s0 = self.doc_to_screen(Point::new(source.x, source.y));
+                let s1 = self.doc_to_screen(Point::new(source.right(), source.bottom()));
+                unsafe { ctx.DrawRectangle(&D2D_RECT_F { left: s0.x, top: s0.y, right: s1.x, bottom: s1.y }, &accent, 1.0, dash.as_ref()) };
+            }
+            if let Annotation::Arrow { start, end, bezier: Some((c1, c2)), .. } = a {
+                let (s, e, a1, a2) = (self.doc_to_screen(*start), self.doc_to_screen(*end), self.doc_to_screen(*c1), self.doc_to_screen(*c2));
+                unsafe {
+                    ctx.DrawLine(v2(s), v2(a1), &accent, 1.0, dash.as_ref());
+                    ctx.DrawLine(v2(e), v2(a2), &accent, 1.0, dash.as_ref());
+                }
+            }
+        }
+        if sel.len() > 1 {
+            if let Some(u) = self.selection_frame() {
+                let s0 = self.doc_to_screen(Point::new(u.x, u.y));
+                let s1 = self.doc_to_screen(Point::new(u.right(), u.bottom()));
+                unsafe { ctx.DrawRectangle(&D2D_RECT_F { left: s0.x, top: s0.y, right: s1.x, bottom: s1.y }, &accent, 1.0, dash.as_ref()) };
+            }
+        }
+        let editing_handles = !matches!(self.gesture, Gesture::Move { moved: true, .. });
+        if editing_handles {
+            for (h, p) in self.handles() {
+                match h {
+                    Handle::Frame(_) => unsafe {
+                        let r = D2D_RECT_F { left: p.x - HANDLE, top: p.y - HANDLE, right: p.x + HANDLE, bottom: p.y + HANDLE };
+                        ctx.FillRectangle(&r, &white);
+                        ctx.DrawRectangle(&r, &accent, 1.5, None);
+                    },
+                    Handle::Rotate => unsafe {
+                        let e = D2D1_ELLIPSE { point: v2(p), radiusX: HANDLE + 1.0, radiusY: HANDLE + 1.0 };
+                        ctx.FillEllipse(&e, &white);
+                        ctx.DrawEllipse(&e, &accent, 1.5, None);
+                    },
+                    Handle::Edit(_) => unsafe {
+                        let yellow = self.renderer.brush(ctx, Color::rgb(0xFF, 0xC8, 0x3A))?;
+                        let e = D2D1_ELLIPSE { point: v2(p), radiusX: HANDLE + 0.5, radiusY: HANDLE + 0.5 };
+                        ctx.FillEllipse(&e, &yellow);
+                        ctx.DrawEllipse(&e, &black, 1.0, None);
+                    },
                 }
             }
         }
         Ok(())
     }
 
-    fn draw_text(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        bounds: Rect,
-        text: &str,
-        color: Color,
-        size: f32,
-    ) -> Result<()> {
-        if text.is_empty() {
-            // Placeholder outline so empty text annotations are still visible.
-            let outline = self.brush(Color::rgb(0x80, 0x80, 0x80))?;
-            let outline_iface: ID2D1Brush = outline.cast()?;
-            let r = D2D_RECT_F {
-                left: bounds.x,
-                top: bounds.y,
-                right: bounds.x + bounds.w,
-                bottom: bounds.y + bounds.h,
-            };
-            unsafe {
-                ctx.DrawRectangle(&r, &outline_iface, 1.0, None);
-            }
+    fn draw_ants(&self, ctx: &ID2D1DeviceContext, outline: &[Point], black: &ID2D1Brush, white: &ID2D1Brush, dash: Option<&ID2D1StrokeStyle>) -> Result<()> {
+        if outline.len() < 2 {
             return Ok(());
         }
-        let brush: ID2D1Brush = self.brush(color)?.cast()?;
-        let format = self.gfx.dwrite.text_format("Segoe UI", size, false, false)?;
-        let text_w: Vec<u16> = text.encode_utf16().collect();
-        let layout = unsafe {
-            self.gfx.dwrite.factory.CreateTextLayout(
-                &text_w,
-                &format,
-                bounds.w.max(1.0),
-                bounds.h.max(1.0),
-            )?
-        };
-        unsafe {
-            ctx.DrawTextLayout(
-                Vector2 { X: bounds.x, Y: bounds.y },
-                &layout,
-                &brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
+        let n = outline.len();
+        let w = 1.0 / self.view_scale;
+        for i in 0..n {
+            let (a, b) = (outline[i], outline[(i + 1) % n]);
+            unsafe {
+                ctx.DrawLine(v2(a), v2(b), black, w, None);
+                ctx.DrawLine(v2(a), v2(b), white, w, dash);
+            }
         }
         Ok(())
     }
 
-    fn draw_step(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        center: Point,
-        radius: f32,
-        value: &str,
-        fill: Color,
-        text_color: Color,
-    ) -> Result<()> {
-        let fill_brush: ID2D1Brush = self.brush(fill)?.cast()?;
-        let text_brush: ID2D1Brush = self.brush(text_color)?.cast()?;
-        let ellipse = D2D1_ELLIPSE {
-            point: Vector2 { X: center.x, Y: center.y },
-            radiusX: radius,
-            radiusY: radius,
+    // ---- selection helpers ----
+
+    pub fn single(&self) -> Option<&Annotation> {
+        if self.selected.len() == 1 { self.doc.get(self.selected[0]) } else { None }
+    }
+
+    pub fn selection_frame(&self) -> Option<Rect> {
+        let mut u: Option<Rect> = None;
+        for id in &self.selected {
+            if let Some(a) = self.doc.get(*id) {
+                let b = a.bounding_box();
+                u = Some(match u {
+                    Some(r) => r.union(&b),
+                    None => b,
+                });
+            }
+        }
+        u
+    }
+
+    pub fn select(&mut self, ids: &[AnnotationId]) {
+        self.selected = self.doc.expand_groups(ids);
+    }
+
+    /// Screen-space handle positions for the current selection.
+    pub fn handles(&self) -> Vec<(Handle, Point)> {
+        let mut out = Vec::new();
+        if matches!(self.active_tool, Tool::Select | Tool::CutOut) {
+            return out;
+        }
+        let (frame, rot, rotatable, edits) = if let Some(a) = self.single() {
+            if self.doc.groups.contains_key(&a.id()) {
+                return out;
+            }
+            (if a.has_frame() { Some(a.frame()) } else { None }, a.rotation(), a.rotatable(), a.edit_points())
+        } else if self.selected.len() > 1 {
+            (self.selection_frame(), 0.0, false, Vec::new())
+        } else {
+            return out;
         };
-        unsafe {
-            ctx.FillEllipse(&ellipse, &fill_brush);
-            let format = self
-                .gfx
-                .dwrite
-                .text_format("Segoe UI", radius * 1.1, true, true)?;
-            let rect = D2D_RECT_F {
-                left: center.x - radius,
-                top: center.y - radius,
-                right: center.x + radius,
-                bottom: center.y + radius,
+        if let Some(f) = frame {
+            let c = f.center();
+            for i in 0..8u8 {
+                out.push((Handle::Frame(i), self.doc_to_screen(frame_point(f, i).rotated(c, rot))));
+            }
+            if rotatable {
+                let top = Point::new(c.x, f.y - ROT_OFFSET / self.view_scale);
+                out.push((Handle::Rotate, self.doc_to_screen(top.rotated(c, rot))));
+            }
+        }
+        for (i, p) in edits.iter().enumerate() {
+            out.push((Handle::Edit(i), self.doc_to_screen(*p)));
+        }
+        out
+    }
+
+    fn handle_at(&self, sx: f32, sy: f32) -> Option<Handle> {
+        // Edit points win over frame handles (they're usually what you want).
+        let hs = self.handles();
+        let near = |p: &Point| (p.x - sx).abs() <= HANDLE + 3.0 && (p.y - sy).abs() <= HANDLE + 3.0;
+        hs.iter().find(|(h, p)| matches!(h, Handle::Edit(_)) && near(p))
+            .or_else(|| hs.iter().find(|(_, p)| near(p)))
+            .map(|(h, _)| *h)
+    }
+
+    fn cursor_for(&self, sx: f32, sy: f32, p: Point) -> *const u16 {
+        if self.space_down || matches!(self.gesture, Gesture::Pan { .. }) {
+            return IDC_HAND;
+        }
+        if let Some(h) = self.handle_at(sx, sy) {
+            return match h {
+                Handle::Frame(i) => {
+                    let rot = self.single().map(|a| a.rotation()).unwrap_or(0.0);
+                    let octant = ((i as f32 * 45.0 + rot + 22.5).rem_euclid(180.0) / 45.0) as u8;
+                    match octant {
+                        0 => IDC_SIZENWSE,
+                        1 => IDC_SIZENS,
+                        2 => IDC_SIZENESW,
+                        _ => IDC_SIZEWE,
+                    }
+                }
+                Handle::Rotate => IDC_HAND,
+                Handle::Edit(_) => IDC_CROSS,
             };
-            let text_w: Vec<u16> = value.encode_utf16().collect();
-            ctx.DrawText(
-                &text_w,
-                &format,
-                &rect,
-                &text_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
         }
-        Ok(())
-    }
-
-    fn draw_highlight(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        bounds: Rect,
-        color: Color,
-    ) -> Result<()> {
-        // Alpha-blend a translucent fill — premultiplied D2D bitmap + an alpha
-        // ~100/255 brush gives a clean highlighter tint over the underlying
-        // pixels. (True multiply-blend would need D2D1_PRIMITIVE_BLEND_MIN
-        // via SetPrimitiveBlend, which the windows 0.61 bindings don't
-        // expose for ID2D1DeviceContext; the alpha path is visually close.)
-        let blend = Color::rgba(color.r, color.g, color.b, 110);
-        let brush: ID2D1Brush = self.brush(blend)?.cast()?;
-        let rect = D2D_RECT_F {
-            left: bounds.x,
-            top: bounds.y,
-            right: bounds.x + bounds.w,
-            bottom: bounds.y + bounds.h,
-        };
-        unsafe {
-            ctx.FillRectangle(&rect, &brush);
-        }
-        Ok(())
-    }
-
-    fn draw_solid(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        bounds: Rect,
-        fill: Color,
-    ) -> Result<()> {
-        let brush: ID2D1Brush = self.brush(fill)?.cast()?;
-        let rect = D2D_RECT_F {
-            left: bounds.x,
-            top: bounds.y,
-            right: bounds.x + bounds.w,
-            bottom: bounds.y + bounds.h,
-        };
-        unsafe {
-            ctx.FillRectangle(&rect, &brush);
-        }
-        Ok(())
-    }
-
-    fn draw_blur(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        bounds: Rect,
-        intensity: f32,
-    ) -> Result<()> {
-        let Some(base) = &self.base else { return Ok(()) };
-        if self.gaussian.is_none() {
-            let eff = unsafe { ctx.CreateEffect(&CLSID_D2D1GaussianBlur)? };
-            self.gaussian = Some(eff);
-        }
-        let effect = self.gaussian.as_ref().unwrap();
-        unsafe {
-            let img: ID2D1Image = base.cast()?;
-            effect.SetInput(0, Some(&img), false);
-            let stdev = (intensity / 3.0).max(0.5);
-            let bytes = stdev.to_le_bytes();
-            effect.SetValue(
-                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32,
-                D2D1_PROPERTY_TYPE_FLOAT,
-                &bytes,
-            )?;
-            let effect_out: ID2D1Image = effect.GetOutput()?;
-            // Draw only the band of the blurred output that overlaps the
-            // annotation bounds.
-            let dest_offset = Vector2 { X: bounds.x, Y: bounds.y };
-            let src = D2D_RECT_F {
-                left: bounds.x,
-                top: bounds.y,
-                right: bounds.x + bounds.w,
-                bottom: bounds.y + bounds.h,
-            };
-            ctx.DrawImage(
-                &effect_out,
-                Some(&dest_offset),
-                Some(&src),
-                D2D1_INTERPOLATION_MODE_LINEAR,
-                D2D1_COMPOSITE_MODE_SOURCE_OVER,
-            );
-        }
-        Ok(())
-    }
-
-    fn draw_magnify(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        source: Rect,
-        display: Rect,
-        line_width: f32,
-        color: Color,
-    ) -> Result<()> {
-        let Some(base) = self.base.clone() else { return Ok(()) };
-        let brush: ID2D1Brush = self.brush(color)?.cast()?;
-        let src = D2D_RECT_F {
-            left: source.x,
-            top: source.y,
-            right: source.x + source.w,
-            bottom: source.y + source.h,
-        };
-        let dst = D2D_RECT_F {
-            left: display.x,
-            top: display.y,
-            right: display.x + display.w,
-            bottom: display.y + display.h,
-        };
-        unsafe {
-            // High-quality scaled blit of the source band into the display rect.
-            let base_bm: windows::Win32::Graphics::Direct2D::ID2D1Bitmap = base.cast()?;
-            ctx.DrawBitmap(
-                &base_bm,
-                Some(&dst),
-                1.0,
-                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                Some(&src),
-                None,
-            );
-            // Outline both rects + connector line.
-            ctx.DrawRectangle(&src, &brush, line_width, None);
-            ctx.DrawRectangle(&dst, &brush, line_width, None);
-            let p_src = Vector2 {
-                X: source.x + source.w * 0.5,
-                Y: source.y + source.h * 0.5,
-            };
-            let p_dst = Vector2 {
-                X: display.x + display.w * 0.5,
-                Y: display.y + display.h * 0.5,
-            };
-            ctx.DrawLine(p_src, p_dst, &brush, line_width, None);
-        }
-        Ok(())
-    }
-
-    fn draw_stamp(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        asset: u8,
-        bounds: Rect,
-    ) -> Result<()> {
-        // Lazy-decode the bundled stamp into a D2D bitmap.
-        let idx = (asset as usize).min(crate::editor::stamps::COUNT - 1);
-        if self.stamps[idx].is_none() {
-            let bm = crate::editor::stamps::bitmap(asset);
-            self.stamps[idx] = Some(crate::gfx::d2d::upload_bitmap(
-                &self.gfx.d2d.context,
-                &bm,
-            )?);
-        }
-        let stamp = self.stamps[idx].as_ref().unwrap().clone();
-        let dest = D2D_RECT_F {
-            left: bounds.x,
-            top: bounds.y,
-            right: bounds.x + bounds.w,
-            bottom: bounds.y + bounds.h,
-        };
-        unsafe {
-            let stamp_bm: windows::Win32::Graphics::Direct2D::ID2D1Bitmap = stamp.cast()?;
-            ctx.DrawBitmap(
-                &stamp_bm,
-                Some(&dest),
-                1.0,
-                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                None,
-                None,
-            );
-        }
-        Ok(())
-    }
-
-    fn draw_preview(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        drag: Drag,
-    ) -> Result<()> {
         match self.active_tool {
-            Tool::Arrow => self.draw_arrow(ctx, drag.start, drag.current, self.style.color, self.style.stroke, None),
-            Tool::BezierArrow => {
-                let dx = drag.current.x - drag.start.x;
-                let dy = drag.current.y - drag.start.y;
-                let len = (dx * dx + dy * dy).sqrt().max(1.0);
-                let mid = Point::new((drag.start.x + drag.current.x) * 0.5, (drag.start.y + drag.current.y) * 0.5);
-                let nx = -dy / len;
-                let ny = dx / len;
-                let bend = (len * 0.25).min(80.0);
-                let b = Some(Point::new(mid.x + nx * bend, mid.y + ny * bend));
-                self.draw_arrow(ctx, drag.start, drag.current, self.style.color, self.style.stroke, b)
+            Tool::Move => {
+                if self.doc.topmost_hit(p, self.tol()).is_some() { IDC_SIZEALL } else { IDC_ARROW }
             }
-            Tool::Magnify => {
-                let bounds = Rect::from_points(drag.start, drag.current);
-                let brush: ID2D1Brush = self.brush(self.style.color)?.cast()?;
-                let r = D2D_RECT_F {
-                    left: bounds.x,
-                    top: bounds.y,
-                    right: bounds.x + bounds.w,
-                    bottom: bounds.y + bounds.h,
-                };
-                unsafe { ctx.DrawRectangle(&r, &brush, self.style.stroke, None) };
-                Ok(())
+            Tool::Select => {
+                if self.pixel_sel.as_ref().map(|s| s.mask_contains(p)).unwrap_or(false) { IDC_SIZEALL } else { IDC_CROSS }
             }
-            Tool::Stamp => Ok(()),
-            Tool::ShapeRect | Tool::ShapeEllipse => {
-                let bounds = Rect::from_points(drag.start, drag.current);
-                let kind = if self.active_tool == Tool::ShapeRect {
-                    ShapeKind::Rectangle
-                } else {
-                    ShapeKind::Ellipse
-                };
-                let fill = Color { a: self.style.fill_alpha, ..self.style.color };
-                self.draw_shape(ctx, kind, bounds, self.style.color, fill, self.style.stroke)
+            _ => {
+                let over_sel = self.selected.iter().any(|id| self.doc.get(*id).map(|a| a.hit_test(p, self.tol())).unwrap_or(false));
+                if over_sel { IDC_SIZEALL } else { IDC_CROSS }
             }
-            Tool::Highlighter => {
-                let bounds = Rect::from_points(drag.start, drag.current);
-                self.draw_highlight(ctx, bounds, self.style.color)
-            }
-            Tool::BlurGaussian => {
-                let bounds = Rect::from_points(drag.start, drag.current);
-                self.draw_blur(ctx, bounds, self.style.blur_intensity)
-            }
-            Tool::BlurSolid => {
-                let bounds = Rect::from_points(drag.start, drag.current);
-                self.draw_solid(ctx, bounds, Color::BLACK)
-            }
-            Tool::SelectionRect => {
-                let bounds = Rect::from_points(drag.start, drag.current);
-                let brush: ID2D1Brush = self.brush(Color::rgba(0x50, 0xA0, 0xFF, 0xFF))?.cast()?;
-                let r = D2D_RECT_F {
-                    left: bounds.x,
-                    top: bounds.y,
-                    right: bounds.x + bounds.w,
-                    bottom: bounds.y + bounds.h,
-                };
-                unsafe { ctx.DrawRectangle(&r, &brush, 1.0, None) };
-                Ok(())
-            }
-            _ => Ok(()),
         }
     }
 
-    fn draw_handles(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        bb: Rect,
-    ) -> Result<()> {
-        let brush: ID2D1Brush = self.brush(Color::rgba(0x50, 0xA0, 0xFF, 0xFF))?.cast()?;
-        let r = D2D_RECT_F {
-            left: bb.x,
-            top: bb.y,
-            right: bb.x + bb.w,
-            bottom: bb.y + bb.h,
+    // ---- commands ----
+
+    fn exec(&mut self, cmd: Command) {
+        history::execute(&mut self.doc, &mut self.history, cmd);
+        self.dirty = true;
+    }
+
+    fn insert_new(&mut self, mut a: Annotation) -> AnnotationId {
+        let id = self.doc.alloc_id();
+        a.set_id(id);
+        let index = self.doc.annotations.len();
+        self.exec(Command::Insert { index, ann: a });
+        id
+    }
+
+    fn prune_selection(&mut self) {
+        let doc = &self.doc;
+        self.selected.retain(|id| doc.find_index(*id).is_some());
+    }
+
+    pub fn undo(&mut self) -> bool {
+        self.cancel_gesture();
+        let r = self.history.undo(&mut self.doc);
+        self.prune_selection();
+        self.dirty |= r;
+        r
+    }
+
+    pub fn redo(&mut self) -> bool {
+        self.cancel_gesture();
+        let r = self.history.redo(&mut self.doc);
+        self.prune_selection();
+        self.dirty |= r;
+        r
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        if !self.selected.is_empty() {
+            let cmd = history::remove_many(&self.doc, &self.selected);
+            self.exec(cmd);
+            self.selected.clear();
+            return true;
+        }
+        if self.pixel_sel.is_some() {
+            return self.sel_fill(self.style.sel_autofill);
+        }
+        false
+    }
+
+    pub fn select_all(&mut self) {
+        if self.active_tool == Tool::Select {
+            self.pixel_sel = Some(PixelSel::from_rect(SelShape::Rectangle, self.doc.canvas_rect()));
+        } else {
+            self.selected = self.doc.annotations.iter().map(|a| a.id()).collect();
+        }
+    }
+
+    pub fn group(&mut self) -> bool {
+        if self.selected.len() < 2 {
+            return false;
+        }
+        let before = self.doc.groups.clone();
+        let mut after = before.clone();
+        let g = after.values().copied().max().unwrap_or(0) + 1;
+        for id in &self.selected {
+            after.insert(*id, g);
+        }
+        self.exec(Command::Groups { before, after });
+        true
+    }
+
+    pub fn ungroup(&mut self) -> bool {
+        let before = self.doc.groups.clone();
+        let mut after = before.clone();
+        for id in &self.selected {
+            after.remove(id);
+        }
+        if after.len() == before.len() {
+            return false;
+        }
+        self.exec(Command::Groups { before, after });
+        true
+    }
+
+    /// Reorder the selection: `to_end` true = front, `step` true = one place.
+    pub fn reorder(&mut self, front: bool, step: bool) -> bool {
+        if self.selected.is_empty() {
+            return false;
+        }
+        let n = self.doc.annotations.len();
+        let mut idx: Vec<usize> = self.selected.iter().filter_map(|id| self.doc.find_index(*id)).collect();
+        idx.sort_unstable();
+        let mut order: Vec<Annotation> = self.doc.annotations.clone();
+        let picked: Vec<Annotation> = idx.iter().map(|&i| order[i].clone()).collect();
+        for &i in idx.iter().rev() {
+            order.remove(i);
+        }
+        let insert_at = if step {
+            if front { (idx[idx.len() - 1] + 2 - idx.len()).min(order.len()) } else { idx[0].saturating_sub(1) }
+        } else if front {
+            order.len()
+        } else {
+            0
         };
-        unsafe {
-            ctx.DrawRectangle(&r, &brush, 1.0, None);
-            for (cx, cy) in [
-                (bb.x, bb.y),
-                (bb.x + bb.w, bb.y),
-                (bb.x, bb.y + bb.h),
-                (bb.x + bb.w, bb.y + bb.h),
-            ] {
-                let h = D2D_RECT_F {
-                    left: cx - HANDLE_HALF,
-                    top: cy - HANDLE_HALF,
-                    right: cx + HANDLE_HALF,
-                    bottom: cy + HANDLE_HALF,
-                };
-                ctx.FillRectangle(&h, &brush);
+        for (k, a) in picked.into_iter().enumerate() {
+            order.insert(insert_at + k, a);
+        }
+        if order.iter().map(|a| a.id()).eq(self.doc.annotations.iter().map(|a| a.id())) {
+            return false;
+        }
+        // Express as remove-all + insert-all so undo restores the order.
+        let mut cmds = vec![history::remove_many(&self.doc, &self.doc.annotations.iter().map(|a| a.id()).collect::<Vec<_>>())];
+        for (i, a) in order.into_iter().enumerate() {
+            cmds.push(Command::Insert { index: i, ann: a });
+        }
+        let _ = n;
+        self.exec(Command::Batch(cmds));
+        true
+    }
+
+    pub fn duplicate(&mut self) -> bool {
+        if self.selected.is_empty() {
+            return false;
+        }
+        let items: Vec<Annotation> = self.selected.iter().filter_map(|id| self.doc.get(*id).cloned()).collect();
+        self.paste_annotations(items, 16.0);
+        true
+    }
+
+    fn paste_annotations(&mut self, items: Vec<Annotation>, offset: f32) {
+        let mut cmds = Vec::new();
+        let mut ids = Vec::new();
+        let mut index = self.doc.annotations.len();
+        for mut a in items {
+            let id = self.doc.alloc_id();
+            a.set_id(id);
+            a.translate(offset, offset);
+            ids.push(id);
+            cmds.push(Command::Insert { index, ann: a });
+            index += 1;
+        }
+        self.exec(Command::Batch(cmds));
+        self.selected = ids;
+    }
+
+    /// Copy: annotations go to the internal clipboard (plus a flattened image
+    /// of their area to the system clipboard); a pixel selection copies its
+    /// pixels.
+    pub fn copy(&mut self) -> bool {
+        if let Some(sel) = &self.pixel_sel {
+            if let Some((bm, _, _)) = pixels::extract(&self.doc.base, sel) {
+                let _ = put_clipboard_image(self.hwnd, &bm);
+                return true;
+            }
+            return false;
+        }
+        if self.selected.is_empty() {
+            return false;
+        }
+        self.clip = self.selected.iter().filter_map(|id| self.doc.get(*id).cloned()).collect();
+        if let Some(r) = self.selection_frame() {
+            if let Ok(full) = render::flatten(&self.gfx, &self.doc, RenderOpts::default()) {
+                let bm = pixels::crop(&full, r.x.floor() as i32, r.y.floor() as i32, r.right().ceil() as i32, r.bottom().ceil() as i32);
+                let _ = put_clipboard_image(self.hwnd, &bm);
             }
         }
-        Ok(())
+        self.clip_seq = clipboard_seq();
+        true
     }
 
-    fn draw_bezier_handle(
-        &mut self,
-        ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
-        cp: Point,
-    ) -> Result<()> {
-        let brush: ID2D1Brush = self.brush(Color::rgb(0xFF, 0xC8, 0x3A))?.cast()?;
-        let r = BEZIER_HANDLE_RADIUS;
-        // Diamond shape.
-        let pts = [
-            Vector2 { X: cp.x, Y: cp.y - r },
-            Vector2 { X: cp.x + r, Y: cp.y },
-            Vector2 { X: cp.x, Y: cp.y + r },
-            Vector2 { X: cp.x - r, Y: cp.y },
-        ];
-        unsafe {
-            let geom = self.gfx.d2d.factory.CreatePathGeometry()?;
-            let sink = geom.Open()?;
-            sink.BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
-            sink.AddLine(pts[1]);
-            sink.AddLine(pts[2]);
-            sink.AddLine(pts[3]);
-            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            sink.Close()?;
-            ctx.FillGeometry(&geom, &brush, None);
+    pub fn cut(&mut self) -> bool {
+        if !self.copy() {
+            return false;
         }
-        Ok(())
+        if self.pixel_sel.is_some() {
+            self.sel_fill(self.style.sel_autofill)
+        } else {
+            self.delete_selection()
+        }
     }
 
-    pub fn screen_to_doc(&self, x: f32, y: f32) -> Point {
-        Point::new(
-            (x - self.view_offset.0) / self.view_scale,
-            (y - self.view_offset.1) / self.view_scale,
-        )
+    pub fn paste(&mut self) -> bool {
+        if !self.clip.is_empty() && clipboard_seq() == self.clip_seq {
+            self.paste_annotations(self.clip.clone(), 16.0);
+            if self.active_tool == Tool::Select {
+                self.active_tool = Tool::Move;
+            }
+            return true;
+        }
+        if let Some(bm) = crate::win::clipboard::read_image(self.hwnd) {
+            self.paste_image(bm);
+            return true;
+        }
+        false
     }
 
-    pub fn doc_to_screen(&self, p: Point) -> (f32, f32) {
-        (
-            self.view_offset.0 + p.x * self.view_scale,
-            self.view_offset.1 + p.y * self.view_scale,
-        )
+    /// Insert a raster as a movable Image layer centred in the view.
+    pub fn paste_image(&mut self, bm: Bitmap) {
+        let c = self.screen_to_doc(self.size.0 as f32 * 0.5, self.size.1 as f32 * 0.5);
+        let (w, h) = (bm.width as f32, bm.height as f32);
+        let a = Annotation::Image { id: 0, bounds: Rect { x: (c.x - w * 0.5).round(), y: (c.y - h * 0.5).round(), w, h }, bitmap: Rc::new(bm), rotation: 0.0 };
+        let id = self.insert_new(a);
+        self.pixel_sel = None;
+        self.selected = vec![id];
+        self.active_tool = Tool::Move;
     }
 
-    pub fn flatten(&self) -> Result<Bitmap> {
-        crate::editor::flatten::flatten(&self.doc)
+    pub fn nudge(&mut self, dx: f32, dy: f32) -> bool {
+        if self.selected.is_empty() {
+            return false;
+        }
+        let mut cmds = Vec::new();
+        for id in self.selected.clone() {
+            if let Some(i) = self.doc.find_index(id) {
+                let before = self.doc.annotations[i].clone();
+                let mut after = before.clone();
+                after.translate(dx, dy);
+                cmds.push(Command::Mutate { id, before, after });
+            }
+        }
+        self.exec(Command::Batch(cmds));
+        true
     }
+
+    /// Mutate the current selection with `f` as one undo step.
+    pub fn mutate_selected(&mut self, f: &dyn Fn(&mut Annotation) -> bool) -> bool {
+        let mut cmds = Vec::new();
+        for id in self.selected.clone() {
+            if let Some(i) = self.doc.find_index(id) {
+                let before = self.doc.annotations[i].clone();
+                let mut after = before.clone();
+                if f(&mut after) {
+                    cmds.push(Command::Mutate { id, before, after });
+                }
+            }
+        }
+        if cmds.is_empty() {
+            return false;
+        }
+        self.exec(Command::Batch(cmds));
+        true
+    }
+
+    /// Bake every annotation into the base image (editor "flatten()").
+    pub fn flatten_annotations(&mut self) -> bool {
+        if self.doc.annotations.is_empty() {
+            return false;
+        }
+        let Ok(flat) = render::flatten(&self.gfx, &self.doc, RenderOpts::default()) else { return false };
+        let ids: Vec<AnnotationId> = self.doc.annotations.iter().map(|a| a.id()).collect();
+        let mut cmds = vec![history::remove_many(&self.doc, &ids)];
+        cmds.push(Command::Base { before: self.doc.base.clone(), after: Rc::new(flat) });
+        if !self.doc.groups.is_empty() {
+            cmds.push(Command::Groups { before: self.doc.groups.clone(), after: Default::default() });
+        }
+        self.exec(Command::Batch(cmds));
+        self.selected.clear();
+        true
+    }
+
+    // ---- pixel selection ops ----
+
+    pub fn sel_fill(&mut self, auto: bool) -> bool {
+        let Some(sel) = self.pixel_sel.clone() else { return false };
+        let out = pixels::fill_selection(&self.doc.base, &sel, auto);
+        self.exec(Command::Base { before: self.doc.base.clone(), after: Rc::new(out) });
+        true
+    }
+
+    pub fn sel_effect(&mut self, fx: Effect) -> bool {
+        let Some(sel) = self.pixel_sel.clone() else { return false };
+        let out = pixels::apply_effect(&self.doc.base, &sel, fx);
+        self.exec(Command::Base { before: self.doc.base.clone(), after: Rc::new(out) });
+        true
+    }
+
+    pub fn sel_invert(&mut self) -> bool {
+        match self.pixel_sel.as_mut() {
+            Some(s) => {
+                s.inverted = !s.inverted;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn sel_crop(&mut self) -> bool {
+        let Some(sel) = self.pixel_sel.clone() else { return false };
+        if sel.inverted {
+            return false;
+        }
+        let (x0, y0, x1, y1) = sel.pixel_bounds(self.doc.base.width, self.doc.base.height);
+        if x1 - x0 < 1 || y1 - y0 < 1 {
+            return false;
+        }
+        let out = pixels::crop(&self.doc.base, x0, y0, x1, y1);
+        let mut cmds = vec![Command::Base { before: self.doc.base.clone(), after: Rc::new(out) }];
+        for a in &self.doc.annotations {
+            let mut after = a.clone();
+            after.translate(-x0 as f32, -y0 as f32);
+            cmds.push(Command::Mutate { id: a.id(), before: a.clone(), after });
+        }
+        self.exec(Command::Batch(cmds));
+        self.pixel_sel = None;
+        self.zoom_fit();
+        true
+    }
+
+    /// Lift the selected pixels into a movable Image layer, filling the hole.
+    fn sel_lift(&mut self) -> Option<AnnotationId> {
+        let sel = self.pixel_sel.clone()?;
+        let (bm, x, y) = pixels::extract(&self.doc.base, &sel)?;
+        let filled = pixels::fill_selection(&self.doc.base, &sel, self.style.sel_autofill);
+        let id = self.doc.alloc_id();
+        let a = Annotation::Image { id, bounds: Rect { x: x as f32, y: y as f32, w: bm.width as f32, h: bm.height as f32 }, bitmap: Rc::new(bm), rotation: 0.0 };
+        let index = self.doc.annotations.len();
+        self.exec(Command::Batch(vec![
+            Command::Base { before: self.doc.base.clone(), after: Rc::new(filled) },
+            Command::Insert { index, ann: a },
+        ]));
+        self.pixel_sel = None;
+        Some(id)
+    }
+
+    fn apply_cut(&mut self, a: f32, b: f32) {
+        let (a, b) = (a.min(b).round() as i32, a.max(b).round() as i32);
+        if b - a < 2 {
+            return;
+        }
+        let horizontal = self.style.cut_horizontal;
+        let out = pixels::cut_band(&self.doc.base, horizontal, a, b, self.style.cut_edge);
+        let removed = (b - a) as f32;
+        let mut cmds = vec![Command::Base { before: self.doc.base.clone(), after: Rc::new(out) }];
+        for ann in &self.doc.annotations {
+            let c = ann.frame().center();
+            let pos = if horizontal { c.y } else { c.x };
+            if pos >= b as f32 {
+                let mut after = ann.clone();
+                if horizontal { after.translate(0.0, -removed) } else { after.translate(-removed, 0.0) }
+                cmds.push(Command::Mutate { id: ann.id(), before: ann.clone(), after });
+            }
+        }
+        self.exec(Command::Batch(cmds));
+        self.clamp_view();
+    }
+
+    /// Snap a point to annotation frame edges and the canvas edges.
+    fn snap(&self, p: Point) -> Point {
+        if !self.style.snap {
+            return p;
+        }
+        let lim = 8.0 / self.view_scale;
+        let mut xs = vec![0.0, self.doc.base.width as f32];
+        let mut ys = vec![0.0, self.doc.base.height as f32];
+        for a in &self.doc.annotations {
+            let b = a.bounding_box();
+            xs.push(b.x);
+            xs.push(b.right());
+            ys.push(b.y);
+            ys.push(b.bottom());
+        }
+        let pick = |v: f32, cands: &[f32]| {
+            cands.iter().copied().filter(|c| (c - v).abs() <= lim).min_by(|a, b| (a - v).abs().partial_cmp(&(b - v).abs()).unwrap()).unwrap_or(v)
+        };
+        Point::new(pick(p.x, &xs), pick(p.y, &ys))
+    }
+
+    pub fn cancel_gesture(&mut self) {
+        match std::mem::replace(&mut self.gesture, Gesture::Idle) {
+            Gesture::Move { originals, moved: true, .. } | Gesture::Resize { originals, .. } => {
+                for o in originals {
+                    if let Some(i) = self.doc.find_index(o.id()) {
+                        self.doc.annotations[i] = o;
+                    }
+                }
+            }
+            Gesture::Rotate { original, .. } | Gesture::EditPoint { original, .. } => {
+                if let Some(i) = self.doc.find_index(original.id()) {
+                    self.doc.annotations[i] = original;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn set_tool(&mut self, t: Tool) {
+        self.cancel_gesture();
+        if t != Tool::Select {
+            self.pixel_sel = None;
+        }
+        if t == Tool::Select || t == Tool::CutOut {
+            self.selected.clear();
+        }
+        self.active_tool = t;
+    }
+
+    /// Load the properties of the selected annotation into the quick style
+    /// so the next annotation inherits them.
+    pub fn adopt_style_from_selection(&mut self) {
+        let Some(a) = self.single().cloned() else { return };
+        let s = &mut self.style;
+        match a {
+            Annotation::Arrow { color, stroke, head, tail, shadow, bezier, .. } => {
+                s.color = color;
+                s.stroke = stroke;
+                s.head = head;
+                s.tail = tail;
+                s.shadow = shadow;
+                s.curved = bezier.is_some();
+            }
+            Annotation::Shape { outline, fill, stroke, shadow, .. } => {
+                s.color = outline;
+                s.fill_alpha = fill.a;
+                s.stroke = stroke;
+                s.shadow = shadow;
+            }
+            Annotation::Text { color, size, .. } => {
+                s.color = color;
+                s.font_size = size;
+            }
+            Annotation::Step { fill, radius, value, .. } => {
+                s.color = fill;
+                s.step_radius = radius;
+                s.step_letters = value.chars().all(|c| c.is_ascii_alphabetic());
+            }
+            _ => {}
+        }
+    }
+
+    // ---- pointer handling ----
+
+    fn on_down(&mut self, sx: f32, sy: f32, shift: bool, ctrl: bool) {
+        let p = self.screen_to_doc(sx, sy);
+        if self.space_down {
+            self.gesture = Gesture::Pan { last: (sx, sy) };
+            return;
+        }
+        // Polygon tool / polygon selection accumulate clicks.
+        if let Gesture::Polygon { pts, .. } = &mut self.gesture {
+            let close = pts.len() >= 3 && pts[0].dist(p) * self.view_scale <= 8.0;
+            if close {
+                self.finish_polygon();
+            } else {
+                pts.push(p);
+            }
+            return;
+        }
+        // Handles of the current selection.
+        if let Some(h) = self.handle_at(sx, sy) {
+            match h {
+                Handle::Frame(i) => {
+                    let (frame0, rot) = match self.single() {
+                        Some(a) if a.has_frame() => (a.frame(), a.rotation()),
+                        _ => (self.selection_frame().unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }), 0.0),
+                    };
+                    let originals = self.selected.iter().filter_map(|id| self.doc.get(*id).cloned()).collect();
+                    self.gesture = Gesture::Resize { handle: i, frame0, rot, originals };
+                }
+                Handle::Rotate => {
+                    if let Some(a) = self.single().cloned() {
+                        let c = a.frame().center();
+                        let angle0 = (p.y - c.y).atan2(p.x - c.x).to_degrees();
+                        self.gesture = Gesture::Rotate { center: c, original: a, angle0 };
+                    }
+                }
+                Handle::Edit(idx) => {
+                    if let Some(a) = self.single().cloned() {
+                        self.gesture = Gesture::EditPoint { idx, original: a };
+                    }
+                }
+            }
+            return;
+        }
+        let tol = self.tol();
+        match self.active_tool {
+            Tool::Move => {
+                match self.doc.topmost_hit(p, tol) {
+                    Some(id) => {
+                        if shift || ctrl {
+                            let grp = self.doc.expand_groups(&[id]);
+                            if self.selected.contains(&id) {
+                                self.selected.retain(|x| !grp.contains(x));
+                            } else {
+                                self.selected.extend(grp);
+                            }
+                        } else if !self.selected.contains(&id) {
+                            self.select(&[id]);
+                        }
+                        let part = if self.selected.len() == 1 {
+                            self.doc.get(id).and_then(|a| a.part_at(p, tol)).unwrap_or(Part::Whole)
+                        } else {
+                            Part::Whole
+                        };
+                        self.begin_move(p, part);
+                    }
+                    None => {
+                        if !shift {
+                            self.selected.clear();
+                        }
+                        self.gesture = Gesture::Marquee { start: p, cur: p, additive: shift };
+                    }
+                }
+            }
+            Tool::Select => {
+                if self.pixel_sel.as_ref().map(|s| s.mask_contains(p)).unwrap_or(false) {
+                    self.gesture = Gesture::PendingLift { start: p };
+                    return;
+                }
+                self.pixel_sel = None;
+                let p = self.snap(p);
+                self.gesture = match self.style.sel_shape {
+                    SelShape::Polygon => Gesture::Polygon { pts: vec![p], hover: p },
+                    SelShape::Freehand => Gesture::Freehand { pts: vec![p] },
+                    _ => Gesture::SelRect { start: p, cur: p },
+                };
+            }
+            Tool::CutOut => self.gesture = Gesture::Band { start: p, cur: p },
+            Tool::Polygon => {
+                self.selected.clear();
+                self.gesture = Gesture::Polygon { pts: vec![p], hover: p };
+            }
+            _ => {
+                // Drawing tools can still grab an already-selected object.
+                let grab = self.selected.iter().copied().find(|id| self.doc.get(*id).map(|a| a.hit_test(p, tol)).unwrap_or(false));
+                if let Some(id) = grab {
+                    let part = self.doc.get(id).and_then(|a| a.part_at(p, tol)).unwrap_or(Part::Whole);
+                    self.begin_move(p, if self.selected.len() == 1 { part } else { Part::Whole });
+                    return;
+                }
+                self.selected.clear();
+                self.gesture = Gesture::Create { start: p, cur: p };
+            }
+        }
+    }
+
+    fn begin_move(&mut self, p: Point, part: Part) {
+        let originals = self.selected.iter().filter_map(|id| self.doc.get(*id).cloned()).collect();
+        self.gesture = Gesture::Move { start: p, last: p, part, originals, moved: false };
+    }
+
+    fn on_move(&mut self, sx: f32, sy: f32, buttons: bool) {
+        let p = self.screen_to_doc(sx, sy);
+        let shift = key_down(VK_SHIFT);
+        let scale = self.view_scale;
+        let snapped = if matches!(self.gesture, Gesture::SelRect { .. }) { self.snap(p) } else { p };
+        match &mut self.gesture {
+            Gesture::Pan { last } => {
+                self.view_offset.0 += sx - last.0;
+                self.view_offset.1 += sy - last.1;
+                *last = (sx, sy);
+                self.user_view = true;
+                self.clamp_view();
+            }
+            Gesture::Create { cur, .. } | Gesture::Marquee { cur, .. } | Gesture::Band { cur, .. } => *cur = p,
+            Gesture::SelRect { cur, .. } => *cur = snapped,
+            Gesture::Polygon { hover, .. } => *hover = p,
+            Gesture::Freehand { pts } => {
+                if pts.last().map(|l| l.dist(p) * scale >= 2.0).unwrap_or(true) {
+                    pts.push(p);
+                }
+            }
+            Gesture::Move { start, last, part, moved, .. } => {
+                if !buttons {
+                    return;
+                }
+                if !*moved && start.dist(p) * scale < 3.0 {
+                    return;
+                }
+                *moved = true;
+                let (dx, dy) = (p.x - last.x, p.y - last.y);
+                *last = p;
+                let part = *part;
+                for id in self.selected.clone() {
+                    if let Some(i) = self.doc.find_index(id) {
+                        self.doc.annotations[i].translate_part(part, dx, dy);
+                    }
+                }
+            }
+            Gesture::Resize { handle, frame0, rot, originals } => {
+                let (h, f0, r) = (*handle, *frame0, *rot);
+                let c0 = f0.center();
+                let local = p.rotated(c0, -r);
+                let mut nf = resize_frame(f0, h, local, shift && h % 2 == 0);
+                if r != 0.0 {
+                    // Keep the opposite handle fixed on screen.
+                    let anchor_w = frame_point(f0, (h + 4) % 8).rotated(c0, r);
+                    let anchor_n = frame_point(nf, (h + 4) % 8).rotated(nf.center(), r);
+                    nf = nf.translated(anchor_w.x - anchor_n.x, anchor_w.y - anchor_n.y);
+                }
+                let originals = originals.clone();
+                let multi = originals.len() > 1;
+                for o in originals {
+                    if let Some(i) = self.doc.find_index(o.id()) {
+                        let mut a = o.clone();
+                        if multi {
+                            let of = o.frame();
+                            a.set_frame(of, f0.map_rect(&nf, of));
+                        } else {
+                            a.set_frame(f0, nf);
+                        }
+                        self.doc.annotations[i] = a;
+                    }
+                }
+            }
+            Gesture::Rotate { center, original, angle0 } => {
+                let ang = (p.y - center.y).atan2(p.x - center.x).to_degrees();
+                let mut deg = original.rotation() + ang - *angle0;
+                if shift {
+                    deg = (deg / 15.0).round() * 15.0;
+                }
+                let mut a = original.clone();
+                a.set_rotation(deg);
+                if let Some(i) = self.doc.find_index(a.id()) {
+                    self.doc.annotations[i] = a;
+                }
+            }
+            Gesture::EditPoint { idx, original } => {
+                let mut a = original.clone();
+                let mut q = p;
+                if shift {
+                    if let Annotation::Arrow { start, end, .. } = &a {
+                        let anchor = if *idx == 1 { *start } else if *idx == 0 { *end } else { q };
+                        q = tools::constrain(Tool::Arrow, anchor, q, true);
+                    }
+                }
+                a.set_edit_point(*idx, q);
+                if let Some(i) = self.doc.find_index(a.id()) {
+                    self.doc.annotations[i] = a;
+                }
+            }
+            Gesture::PendingLift { start } => {
+                if start.dist(p) * scale >= 3.0 {
+                    let start = *start;
+                    if let Some(id) = self.sel_lift() {
+                        self.selected = vec![id];
+                        self.active_tool = Tool::Move;
+                        self.begin_move(start, Part::Whole);
+                        self.on_move(sx, sy, true);
+                    }
+                }
+            }
+            Gesture::Idle => {}
+        }
+    }
+
+    /// Returns a text-edit request when the gesture created a text-bearing
+    /// annotation.
+    fn on_up(&mut self, sx: f32, sy: f32) -> Option<TextEditReq> {
+        let p = self.screen_to_doc(sx, sy);
+        let shift = key_down(VK_SHIFT);
+        let g = std::mem::replace(&mut self.gesture, Gesture::Idle);
+        match g {
+            Gesture::Polygon { pts, hover } => {
+                // Keep collecting clicks.
+                self.gesture = Gesture::Polygon { pts, hover };
+            }
+            Gesture::Create { start, .. } => {
+                let end = tools::constrain(self.active_tool, start, p, shift);
+                if let Some(a) = tools::create_from_drag(self.active_tool, &self.style, start, end, &self.doc) {
+                    let is_text = matches!(a, Annotation::Text { .. } | Annotation::Callout { .. });
+                    let id = self.insert_new(a);
+                    self.selected = vec![id];
+                    if is_text {
+                        return self.text_edit_request(id);
+                    }
+                }
+            }
+            Gesture::Marquee { start, cur, additive } => {
+                let r = Rect::from_points(start, cur);
+                let mut hits: Vec<AnnotationId> = self.doc.annotations.iter().filter(|a| {
+                    let b = a.bounding_box();
+                    b.x >= r.x && b.y >= r.y && b.right() <= r.right() && b.bottom() <= r.bottom()
+                }).map(|a| a.id()).collect();
+                if additive {
+                    hits.extend(self.selected.iter().copied());
+                }
+                self.select(&hits);
+            }
+            Gesture::Move { originals, moved, .. } => {
+                if moved {
+                    let mut cmds = Vec::new();
+                    for o in originals {
+                        if let Some(i) = self.doc.find_index(o.id()) {
+                            cmds.push(Command::Mutate { id: o.id(), before: o, after: self.doc.annotations[i].clone() });
+                        }
+                    }
+                    self.history.push(Command::Batch(cmds));
+                    self.dirty = true;
+                }
+            }
+            Gesture::Resize { originals, .. } => {
+                let mut cmds = Vec::new();
+                for o in originals {
+                    if let Some(i) = self.doc.find_index(o.id()) {
+                        cmds.push(Command::Mutate { id: o.id(), before: o, after: self.doc.annotations[i].clone() });
+                    }
+                }
+                self.history.push(Command::Batch(cmds));
+                self.dirty = true;
+            }
+            Gesture::Rotate { original, .. } | Gesture::EditPoint { original, .. } => {
+                if let Some(i) = self.doc.find_index(original.id()) {
+                    let after = self.doc.annotations[i].clone();
+                    self.history.push(Command::Mutate { id: original.id(), before: original, after });
+                    self.dirty = true;
+                }
+            }
+            Gesture::SelRect { start, cur } => {
+                let end = tools::constrain(Tool::Select, start, cur, shift);
+                let r = Rect::from_points(start, end);
+                if r.w * self.view_scale < 3.0 || r.h * self.view_scale < 3.0 {
+                    // Click: snap-to-object selects the frame under the cursor.
+                    if self.style.snap {
+                        if let Some(id) = self.doc.topmost_hit(start, self.tol()) {
+                            let b = self.doc.get(id).map(|a| a.bounding_box()).unwrap();
+                            self.pixel_sel = Some(PixelSel::from_rect(SelShape::Rectangle, b));
+                        }
+                    }
+                } else {
+                    self.pixel_sel = Some(PixelSel::from_rect(self.style.sel_shape, r));
+                }
+            }
+            Gesture::Freehand { pts } => {
+                if pts.len() >= 3 && Rect::bounding(&pts).w * self.view_scale >= 3.0 {
+                    self.pixel_sel = Some(PixelSel { shape: SelShape::Freehand, outline: pts, inverted: false });
+                }
+            }
+            Gesture::Band { start, cur } => {
+                if self.style.cut_horizontal { self.apply_cut(start.y, cur.y) } else { self.apply_cut(start.x, cur.x) }
+            }
+            Gesture::PendingLift { .. } => {}
+            Gesture::Pan { .. } | Gesture::Idle => {}
+        }
+        None
+    }
+
+    pub fn finish_polygon(&mut self) {
+        if let Gesture::Polygon { mut pts, .. } = std::mem::replace(&mut self.gesture, Gesture::Idle) {
+            // A double-click adds a duplicate final point; drop near-duplicates.
+            pts.dedup_by(|a, b| a.dist(*b) < 1.0);
+            if self.active_tool == Tool::Polygon {
+                if let Some(a) = tools::create_polygon(&self.style, pts) {
+                    let id = self.insert_new(a);
+                    self.selected = vec![id];
+                }
+            } else if pts.len() >= 3 {
+                self.pixel_sel = Some(PixelSel { shape: SelShape::Polygon, outline: pts, inverted: false });
+            }
+        }
+    }
+
+    pub fn polygon_in_progress(&self) -> bool {
+        matches!(self.gesture, Gesture::Polygon { .. })
+    }
+
+    /// Request an in-place editor for a text-bearing annotation.
+    pub fn text_edit_request(&self, id: AnnotationId) -> Option<TextEditReq> {
+        let a = self.doc.get(id)?;
+        let (rect, text, size) = match a {
+            Annotation::Text { bounds, text, size, .. } => (*bounds, text.clone(), *size),
+            Annotation::Callout { bounds, text, size, .. } => (bounds.inflated(-render::CALLOUT_PAD), text.clone(), *size),
+            Annotation::Step { center, radius, value, .. } => {
+                let r = radius.max(18.0);
+                (Rect { x: center.x - r, y: center.y - r * 0.6, w: r * 2.0 + 20.0, h: r * 1.2 }, value.clone(), radius * 0.9)
+            }
+            _ => return None,
+        };
+        let tl = self.doc_to_screen(Point::new(rect.x, rect.y));
+        Some(TextEditReq {
+            id,
+            rect: Rect { x: tl.x, y: tl.y, w: rect.w * self.view_scale, h: rect.h * self.view_scale },
+            text,
+            size: size * self.view_scale,
+        })
+    }
+
+    pub fn flatten(&self, secure: bool) -> Result<Bitmap> {
+        render::flatten(&self.gfx, &self.doc, RenderOpts { secure, skip: None })
+    }
+
+    /// Whether any blur/pixelate (reversible) redactions are present.
+    pub fn has_soft_redactions(&self) -> bool {
+        self.doc.annotations.iter().any(|a| matches!(a, Annotation::Blur { mode, .. } if *mode != crate::editor::annotation::BlurMode::Solid))
+    }
+}
+
+impl PixelSel {
+    pub fn mask_contains(&self, p: Point) -> bool {
+        let inside = crate::editor::annotation::point_in_polygon(p, &self.outline);
+        inside != self.inverted
+    }
+}
+
+/// Handle positions on a frame: 0 TL, 1 T, 2 TR, 3 R, 4 BR, 5 B, 6 BL, 7 L.
+pub fn frame_point(f: Rect, i: u8) -> Point {
+    let (l, t, r, b, cx, cy) = (f.x, f.y, f.right(), f.bottom(), f.center().x, f.center().y);
+    match i {
+        0 => Point::new(l, t),
+        1 => Point::new(cx, t),
+        2 => Point::new(r, t),
+        3 => Point::new(r, cy),
+        4 => Point::new(r, b),
+        5 => Point::new(cx, b),
+        6 => Point::new(l, b),
+        _ => Point::new(l, cy),
+    }
+}
+
+fn resize_frame(f: Rect, h: u8, p: Point, keep_aspect: bool) -> Rect {
+    let (mut l, mut t, mut r, mut b) = (f.x, f.y, f.right(), f.bottom());
+    if matches!(h, 0 | 6 | 7) {
+        l = p.x;
+    }
+    if matches!(h, 2 | 3 | 4) {
+        r = p.x;
+    }
+    if matches!(h, 0 | 1 | 2) {
+        t = p.y;
+    }
+    if matches!(h, 4 | 5 | 6) {
+        b = p.y;
+    }
+    if keep_aspect && f.w > 0.0 && f.h > 0.0 {
+        let s = ((r - l) / f.w).abs().max(((b - t) / f.h).abs());
+        let (nw, nh) = (f.w * s, f.h * s);
+        if matches!(h, 0 | 6) { l = r - nw * (r - l).signum() } else { r = l + nw * (r - l).signum() }
+        if matches!(h, 0 | 2) { t = b - nh * (b - t).signum() } else { b = t + nh * (b - t).signum() }
+    }
+    let nf = Rect::from_points(Point::new(l, t), Point::new(r, b));
+    Rect { w: nf.w.max(2.0), h: nf.h.max(2.0), ..nf }
+}
+
+fn clipboard_seq() -> u32 {
+    unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+
+pub fn put_clipboard_image(hwnd: HWND, bm: &Bitmap) -> Result<()> {
+    let png = crate::gfx::gdiplus::encode_png_bytes(bm)?;
+    crate::win::clipboard::write_image(hwnd, bm, &png)
 }
 
 // --- Child window registration & wndproc ---
@@ -854,13 +1483,13 @@ pub fn register_class() {
         let cname = crate::win::wide(CLASS_NAME);
         let wc = WNDCLASSEXW {
             cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: 0,
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: GetModuleHandleW(core::ptr::null()) as _,
             hIcon: 0,
-            hCursor: LoadCursorW(0, IDC_ARROW),
+            hCursor: 0,
             hbrBackground: 0,
             lpszMenuName: core::ptr::null(),
             lpszClassName: cname.as_ptr(),
@@ -878,7 +1507,7 @@ pub fn create_child(parent: HWND, rect: RECT) -> Result<HWND> {
             0,
             cname.as_ptr(),
             core::ptr::null(),
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             rect.left,
             rect.top,
             rect.right - rect.left,
@@ -895,22 +1524,28 @@ pub fn create_child(parent: HWND, rect: RECT) -> Result<HWND> {
     }
 }
 
+fn xy(l: LPARAM) -> (f32, f32) {
+    ((l & 0xFFFF) as i16 as f32, ((l >> 16) & 0xFFFF) as i16 as f32)
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // Each child looks up the shared EditorState via the parent hwnd.
     let parent = unsafe { GetParent(hwnd) };
-    let state = crate::editor::window::get_state(parent);
-    let Some(state) = state else {
+    let Some(state) = crate::editor::window::get_state(parent) else {
         return unsafe { DefWindowProcW(hwnd, msg, w, l) };
+    };
+    let refresh = |all: bool| unsafe {
+        InvalidateRect(hwnd, core::ptr::null(), 0);
+        if all {
+            crate::editor::window::refresh_panels(parent);
+        }
     };
     unsafe {
         match msg {
             windows_sys::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => 1,
             WM_PAINT => {
-                // Validate the update region then draw via D2D Present.
                 let mut ps: windows_sys::Win32::Graphics::Gdi::PAINTSTRUCT = core::mem::zeroed();
                 windows_sys::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
-                {
-                    let mut st = state.borrow_mut();
+                if let Ok(mut st) = state.try_borrow_mut() {
                     let _ = st.canvas.render();
                 }
                 windows_sys::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
@@ -919,229 +1554,209 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             WM_SIZE => {
                 let cw = (l & 0xFFFF) as u16 as u32;
                 let ch = ((l >> 16) & 0xFFFF) as u16 as u32;
-                let mut st = state.borrow_mut();
-                let _ = st.canvas.resize(cw.max(1), ch.max(1));
-                drop(st);
-                InvalidateRect(hwnd, core::ptr::null(), 0);
+                let _ = state.borrow_mut().canvas.resize(cw.max(1), ch.max(1));
+                refresh(false);
+                0
+            }
+            WM_SETCURSOR => {
+                if (l & 0xFFFF) as u32 == HTCLIENT {
+                    let c = state.borrow().canvas.cursor;
+                    SetCursor(LoadCursorW(0, c));
+                    return 1;
+                }
+                DefWindowProcW(hwnd, msg, w, l)
+            }
+            WM_MBUTTONDOWN => {
+                SetFocus(hwnd);
+                SetCapture(hwnd);
+                let (x, y) = xy(l);
+                state.borrow_mut().canvas.gesture = Gesture::Pan { last: (x, y) };
+                0
+            }
+            WM_MBUTTONUP => {
+                ReleaseCapture();
+                state.borrow_mut().canvas.gesture = Gesture::Idle;
                 0
             }
             WM_LBUTTONDOWN => {
                 SetFocus(hwnd);
                 SetCapture(hwnd);
-                let x = (l & 0xFFFF) as i16 as i32;
-                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
-                let mut st = state.borrow_mut();
-                let p = st.canvas.screen_to_doc(x as f32, y as f32);
-
-                // Check for bezier CP handle hit on selected arrow.
-                let hit_cp = st.canvas.selected.and_then(|sel| {
-                    let idx = st.canvas.doc.find_index(sel)?;
-                    if let Annotation::Arrow { bezier: Some(cp), .. } = &st.canvas.doc.annotations[idx] {
-                        let dx = p.x - cp.x;
-                        let dy = p.y - cp.y;
-                        if dx * dx + dy * dy <= BEZIER_HANDLE_RADIUS * BEZIER_HANDLE_RADIUS {
-                            return Some(sel);
-                        }
-                    }
-                    None
-                });
-
-                if let Some(id) = hit_cp {
-                    if let Some(idx) = st.canvas.doc.find_index(id) {
-                        st.canvas.handle_drag = Some(HandleDrag {
-                            id,
-                            original_ann: st.canvas.doc.annotations[idx].clone(),
-                        });
-                    }
-                } else if st.canvas.active_tool == Tool::Move {
-                    st.canvas.selected = st.canvas.doc.topmost_hit(p);
-                    st.canvas.move_anchor = Some(p);
-                } else {
-                    st.canvas.drag = Some(Drag { start: p, current: p });
-                }
-                drop(st);
-                InvalidateRect(hwnd, core::ptr::null(), 0);
+                let (x, y) = xy(l);
+                let shift = (w & 0x4) != 0;
+                let ctrl = (w & 0x8) != 0;
+                state.borrow_mut().canvas.on_down(x, y, shift, ctrl);
+                refresh(true);
                 0
             }
             WM_MOUSEMOVE => {
-                let x = (l & 0xFFFF) as i16 as i32;
-                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
+                let (x, y) = xy(l);
+                let buttons = (w & 0x13) != 0;
                 let mut st = state.borrow_mut();
-                let p = st.canvas.screen_to_doc(x as f32, y as f32);
-
-                // Handle bezier CP drag.
-                if let Some(ref hd) = st.canvas.handle_drag {
-                    if let Some(idx) = st.canvas.doc.find_index(hd.id) {
-                        if let Annotation::Arrow { bezier: Some(ref mut cp), .. } = st.canvas.doc.annotations[idx] {
-                            *cp = p;
-                        }
-                    }
-                    drop(st);
-                    InvalidateRect(hwnd, core::ptr::null(), 0);
-                    return 0;
-                }
-
-                if let Some(drag) = st.canvas.drag.as_mut() {
-                    drag.current = p;
-                    drop(st);
-                    InvalidateRect(hwnd, core::ptr::null(), 0);
-                    return 0;
-                }
-                if st.canvas.active_tool == Tool::Move {
-                    if let (Some(sel), Some(anchor)) = (st.canvas.selected, st.canvas.move_anchor) {
-                        if let Some(i) = st.canvas.doc.find_index(sel) {
-                            let dx = p.x - anchor.x;
-                            let dy = p.y - anchor.y;
-                            st.canvas.doc.annotations[i].translate(dx, dy);
-                            st.canvas.move_anchor = Some(p);
-                            drop(st);
-                            InvalidateRect(hwnd, core::ptr::null(), 0);
-                        }
-                    }
+                let busy = !matches!(st.canvas.gesture, Gesture::Idle);
+                st.canvas.on_move(x, y, buttons);
+                let p = st.canvas.screen_to_doc(x, y);
+                st.canvas.cursor = st.canvas.cursor_for(x, y, p);
+                let c = st.canvas.cursor;
+                drop(st);
+                SetCursor(LoadCursorW(0, c));
+                if busy {
+                    refresh(false);
                 }
                 0
             }
             WM_LBUTTONUP => {
                 ReleaseCapture();
-                let mut text_spawn: Option<(u32, crate::editor::annotation::Rect, f32, f32, (f32, f32))> = None;
-                {
-                    let mut st = state.borrow_mut();
-
-                    // Commit bezier CP drag.
-                    if let Some(hd) = st.canvas.handle_drag.take() {
-                        if let Some(idx) = st.canvas.doc.find_index(hd.id) {
-                            let after = st.canvas.doc.annotations[idx].clone();
-                            st.history.push(Command::Mutate {
-                                id: hd.id,
-                                before: hd.original_ann,
-                                after,
-                            });
-                        }
-                    }
-
-                    if let Some(drag) = st.canvas.drag.take() {
-                        let tool = st.canvas.active_tool;
-                        let style = st.canvas.style;
-                        if let Some(cmd) =
-                            crate::editor::tools::commit_drag(tool, style, drag, &mut st.canvas.doc)
-                        {
-                            // Text annotations get the hosted EDIT spawned.
-                            if tool == Tool::Text {
-                                if let crate::editor::history::Command::Insert { ann, .. } = &cmd {
-                                    if let crate::editor::annotation::Annotation::Text {
-                                        id, bounds, size, ..
-                                    } = ann
-                                    {
-                                        text_spawn = Some((
-                                            *id,
-                                            *bounds,
-                                            *size,
-                                            st.canvas.view_scale,
-                                            st.canvas.view_offset,
-                                        ));
-                                    }
-                                }
-                            }
-                            st.history.push(cmd);
-                        }
-                    }
-                    st.canvas.move_anchor = None;
+                let (x, y) = xy(l);
+                let req = state.borrow_mut().canvas.on_up(x, y);
+                refresh(true);
+                if let Some(r) = req {
+                    crate::editor::text_edit::spawn_for(parent, hwnd, r);
                 }
-                InvalidateRect(hwnd, core::ptr::null(), 0);
-                if let Some((id, bounds, size, scale, offset)) = text_spawn {
-                    let parent = GetParent(hwnd);
-                    let rect = crate::editor::text_edit::doc_rect_to_parent(scale, offset, bounds);
-                    let _ = crate::editor::text_edit::spawn(parent, hwnd, id, rect, "", size);
+                0
+            }
+            WM_CAPTURECHANGED => {
+                let mut st = state.borrow_mut();
+                if matches!(st.canvas.gesture, Gesture::Pan { .. }) {
+                    st.canvas.gesture = Gesture::Idle;
                 }
                 0
             }
             WM_LBUTTONDBLCLK => {
-                // Re-enter text edit if the double-click lands on an existing
-                // Text annotation.
-                let x = (l & 0xFFFF) as i16 as i32;
-                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
-                let target = {
-                    let st = state.borrow();
-                    let p = st.canvas.screen_to_doc(x as f32, y as f32);
-                    if let Some(id) = st.canvas.doc.topmost_hit(p) {
-                        if let Some(idx) = st.canvas.doc.find_index(id) {
-                            if let crate::editor::annotation::Annotation::Text {
-                                bounds, text, size, ..
-                            } = &st.canvas.doc.annotations[idx]
-                            {
-                                Some((
-                                    id,
-                                    *bounds,
-                                    text.clone(),
-                                    *size,
-                                    st.canvas.view_scale,
-                                    st.canvas.view_offset,
-                                ))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
+                let (x, y) = xy(l);
+                let req = {
+                    let mut st = state.borrow_mut();
+                    if st.canvas.polygon_in_progress() {
+                        st.canvas.finish_polygon();
                         None
+                    } else {
+                        let p = st.canvas.screen_to_doc(x, y);
+                        let tol = st.canvas.tol();
+                        match st.canvas.doc.topmost_hit(p, tol) {
+                            Some(id) => {
+                                st.canvas.selected = vec![id];
+                                st.canvas.text_edit_request(id)
+                            }
+                            None => None,
+                        }
                     }
                 };
-                if let Some((id, bounds, text, size, scale, offset)) = target {
-                    let parent = GetParent(hwnd);
-                    let rect = crate::editor::text_edit::doc_rect_to_parent(scale, offset, bounds);
-                    let _ = crate::editor::text_edit::spawn(parent, hwnd, id, rect, &text, size);
+                refresh(true);
+                if let Some(r) = req {
+                    crate::editor::text_edit::spawn_for(parent, hwnd, r);
+                }
+                0
+            }
+            WM_RBUTTONUP => {
+                let (x, y) = xy(l);
+                {
+                    let mut st = state.borrow_mut();
+                    // Right-click on an unselected object selects it first.
+                    if st.canvas.active_tool != Tool::Select {
+                        let p = st.canvas.screen_to_doc(x, y);
+                        let tol = st.canvas.tol();
+                        if let Some(id) = st.canvas.doc.topmost_hit(p, tol) {
+                            if !st.canvas.selected.contains(&id) {
+                                st.canvas.select(&[id]);
+                            }
+                        }
+                    }
+                }
+                refresh(true);
+                let mut pt = POINT { x: x as i32, y: y as i32 };
+                windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut pt);
+                crate::editor::window::show_context_menu(parent, pt.x, pt.y);
+                0
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((w >> 16) & 0xFFFF) as i16 as f32 / 120.0;
+                let mut pt = POINT { x: (l & 0xFFFF) as i16 as i32, y: ((l >> 16) & 0xFFFF) as i16 as i32 };
+                ScreenToClient(hwnd, &mut pt);
+                let ctrl = (w & 0x8) != 0;
+                let shift = (w & 0x4) != 0;
+                {
+                    let mut st = state.borrow_mut();
+                    let c = &mut st.canvas;
+                    if ctrl {
+                        let s = c.view_scale * 1.15f32.powf(delta);
+                        c.zoom_to(s, pt.x as f32, pt.y as f32);
+                    } else if shift {
+                        c.view_offset.0 += delta * 60.0;
+                        c.user_view = true;
+                        c.clamp_view();
+                    } else {
+                        c.view_offset.1 += delta * 60.0;
+                        c.user_view = true;
+                        c.clamp_view();
+                    }
+                }
+                refresh(true);
+                0
+            }
+            WM_KEYUP => {
+                if w as u16 == VK_SPACE {
+                    state.borrow_mut().canvas.space_down = false;
                 }
                 0
             }
             WM_KEYDOWN => {
-                let ctrl = (GetKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
-                let key = w as u32;
-                let mut st = state.borrow_mut();
-                let mut invalidate = false;
-                if key == VK_ESCAPE as u32 {
-                    // Cancel bezier CP drag if active.
-                    if let Some(hd) = st.canvas.handle_drag.take() {
-                        if let Some(idx) = st.canvas.doc.find_index(hd.id) {
-                            st.canvas.doc.annotations[idx] = hd.original_ann;
-                        }
-                    }
-                    st.canvas.selected = None;
-                    invalidate = true;
-                } else if key == VK_DELETE as u32 || key == VK_BACK as u32 {
-                    if let Some(sel) = st.canvas.selected {
-                        if let Some(idx) = st.canvas.doc.find_index(sel) {
-                            let ann = st.canvas.doc.annotations.remove(idx);
-                            st.history.push(crate::editor::history::Command::Remove { index: idx, ann });
-                            st.canvas.selected = None;
-                            invalidate = true;
-                        }
-                    }
-                } else if ctrl && key == VK_Z as u32 {
-                    let s = &mut *st;
-                    s.history.undo(&mut s.canvas.doc);
-                    invalidate = true;
-                } else if ctrl && key == VK_Y as u32 {
-                    let s = &mut *st;
-                    s.history.redo(&mut s.canvas.doc);
-                    invalidate = true;
+                let key = w as u16;
+                let ctrl = key_down(VK_CONTROL);
+                let shift = key_down(VK_SHIFT);
+                let alt = key_down(VK_MENU);
+                // Menu accelerators are routed to the parent's WM_COMMAND.
+                if let Some(cmd) = crate::editor::window::accelerator(key, ctrl, shift, alt) {
+                    PostMessageW(parent, WM_COMMAND, cmd as WPARAM, 0);
+                    return 0;
                 }
+                let mut st = state.borrow_mut();
+                let c = &mut st.canvas;
+                let changed = match key {
+                    VK_SPACE => {
+                        c.space_down = true;
+                        false
+                    }
+                    VK_ESCAPE => {
+                        let was_busy = !matches!(c.gesture, Gesture::Idle);
+                        c.cancel_gesture();
+                        if !was_busy {
+                            c.selected.clear();
+                            c.pixel_sel = None;
+                        }
+                        true
+                    }
+                    VK_RETURN => {
+                        c.finish_polygon();
+                        true
+                    }
+                    VK_DELETE | VK_BACK => c.delete_selection(),
+                    VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN => {
+                        let d = if shift { 10.0 } else { 1.0 };
+                        let (dx, dy) = match key {
+                            VK_LEFT => (-d, 0.0),
+                            VK_RIGHT => (d, 0.0),
+                            VK_UP => (0.0, -d),
+                            _ => (0.0, d),
+                        };
+                        c.nudge(dx, dy)
+                    }
+                    k if !ctrl && !alt && (b'A' as u16..=b'Z' as u16).contains(&k) => {
+                        match Tool::ALL.iter().find(|t| t.key() as u16 == k) {
+                            Some(t) => {
+                                c.set_tool(*t);
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                };
                 drop(st);
-                if invalidate {
-                    InvalidateRect(hwnd, core::ptr::null(), 0);
+                if changed {
+                    refresh(true);
                 }
                 0
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
         }
     }
-}
-
-// Suppress unused-import warnings for items that are about to be used by later phases.
-#[allow(dead_code)]
-fn _silence() {
-    let _: D2D1_PRIMITIVE_BLEND = D2D1_PRIMITIVE_BLEND_SOURCE_OVER;
-    let _ = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
-    let _: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
-    let _: D2D1_BEZIER_SEGMENT = unsafe { core::mem::zeroed() };
 }

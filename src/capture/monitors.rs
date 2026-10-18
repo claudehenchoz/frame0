@@ -56,3 +56,12 @@ unsafe extern "system" fn callback(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, 
         1
     }
 }
+
+/// The monitor containing screen point (x, y), or the primary one.
+pub fn at_point(x: i32, y: i32) -> Option<Monitor> {
+    let mons = list();
+    mons.iter()
+        .find(|m| x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h)
+        .or_else(|| mons.iter().find(|m| m.primary))
+        .copied()
+}

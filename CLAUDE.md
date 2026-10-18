@@ -4,9 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`frame` is a single-binary Windows screenshot + annotation tool. The full product spec lives in `PROMPT.md`. v2 shipped: region capture, D2D-rendered editor with Arrow / Curve(Bezier) / Shape (rect+ellipse) / Text(in-place edit) / Step / Highlighter / Blur(real Gaussian) / Redact / Magnify / Stamp(4 bundled) / Selection(rect) / Move, undo/redo, PNG/JPG/clipboard export, `.frame` project save/load (v2 format), background pre-warm thread.
+`frame` is a single-binary Windows screenshot + annotation tool. The full product spec lives in `PROMPT.md`, and v3 implements all of it:
+- **Capture:** region, full screen / per monitor, fixed region, window pick (hover highlight), open-window list (PrintWindow, also for covered or minimized windows), scrolling capture, delayed and interval capture, repeat last, clipboard and file input, presets, effects (border, shadow), and output to the editor, the clipboard or a file.
+- **Editor tools:** Move, Selection (rect/ellipse/polygon/freehand with delete, auto-fill, crop, invert, effects, copy and lift-to-layer), Arrow (end styles, curved with 2 bezier handles, shadow), Rectangle, Ellipse, Polygon, Callout (tails, corner radius), Text, Step (1,2,3 or A,B,C, editable labels), Highlighter, Blur/Pixelate/Solid redaction, Stamp (emoji, labels, user PNGs; categories and search), Magnify and Cut-out.
+- **Object operations:** move, resize and rotate handles, multi-select and marquee, group/ungroup, copy/paste/duplicate, z-order, flatten, undo/redo.
+- **Output:** PNG/JPG/clipboard export through the same D2D renderer as the canvas, and `.frame` projects (v3).
 
-Still **deferred** from the spec — don't assume they exist: Callout (rounded body + tails), Cut-out (band removal from base), polygon/freehand selection shapes, selection operations (delete/fill/invert/content-aware-fill), scrolling capture, presets UI, DXGI Desktop Duplication, window-pick hover-highlight, dedicated property panel.
+Not done: DXGI Desktop Duplication (capture uses BitBlt/PrintWindow).
 
 ## Build commands
 
@@ -26,29 +30,30 @@ There are no tests. Adding one would need the test runner to play nicely with `b
 
 ### Binary-size discipline
 
-Current release: ~122 KB (v2). Plan ceiling was 1 MB; the original v1.5 target was <500 KB and v2 stays well under both. Avoid `format!`/`Debug` outside cold paths and avoid proc-macro deps (`windows-implement`, `serde_derive`, `thiserror`); the build flags above strip a lot but the wins only show when those traps stay out of the hot code. Measure after non-trivial additions: `ls target/x86_64-pc-windows-msvc/release/frame.exe`.
+Current release: ~308 KB (v3). Plan ceiling was 1 MB; the original v1.5 target was <500 KB and v3 stays under both. Avoid `format!`/`Debug` outside cold paths and avoid proc-macro deps (`windows-implement`, `serde_derive`, `thiserror`); the build flags above strip a lot but the wins only show when those traps stay out of the hot code. Measure after non-trivial additions: `ls target/x86_64-pc-windows-msvc/release/frame.exe`.
 
 ## Architecture
 
 ### Process model
 
 Single binary, single instance, persistent tray. `main.rs` spawns `gfx::prewarm::spawn()` (background thread that LoadLibrarys d2d1/dwrite/d3d11/gdiplus and primes the DirectWrite font collection), then creates `App` (`app.rs`) which owns a hidden `HWND_MESSAGE` window. That window receives:
-- `WM_HOTKEY` (id=1) → `App::capture_and_save` → opens editor
+- `WM_HOTKEY` (id=1) → `App::run_capture` (region) → editor / clipboard / file
 - `WM_TRAY` (custom, `WM_APP+1`) → double-click capture / right-click context menu
 - `WM_COMMAND` → tray menu commands
 - `TaskbarCreated` registered message → re-add tray icon after Explorer restart
 
-Control flows: hotkey/tray → `bitblt::virtual_screen` (snapshot) → `overlay::region::pick` (fullscreen drag-rect window) → `bitblt::region` (final shot) → `EditorWindow::create` (or `replace_image` if editor open).
+Control flows: hotkey/tray command → `App::run_capture(CaptureSettings)` (`app.rs`; optional delay timer → resolve target via `overlay::region` / `overlay::window_pick` / `capture::*` → effects → output routing) → `App::open_editor` / `open_document`. `frame.exe --cmd <id> [--pid <pid>]` posts a tray command to a running instance (handy for testing). `FRAME_INI` overrides the ini path.
 
 ### Editor window topology
 
-v2 split: the editor is a **parent window** (`EditorWindow`) with two child windows:
+The editor is a **parent window** (`EditorWindow`) with three child windows (toolbar, canvas, property panel):
 - `editor::toolbar` — child HWND, own window class, paints itself with GDI (double-buffered memory DC). Mouse clicks update the shared `EditorState` and invalidate the canvas.
-- `editor::canvas` — child HWND, own window class, owns a DXGI flip-model swap chain bound to its HWND. WM_PAINT calls `Canvas::render()` which does D2D `BeginDraw` / `EndDraw` / `Present`. WM_ERASEBKGND returns 1.
+- `editor::canvas` — child HWND (`WS_CLIPSIBLINGS` so the text EDIT can sit above it), owns a DXGI flip-model swap chain and the whole interaction state machine (`Gesture`): selection, handles, drawing tools, pixel selection, cut-out, zoom/pan. Keyboard accelerators are mapped in `window::accelerator` and posted to the parent as WM_COMMAND.
+- `editor::property` — child HWND, GDI panel built from a declarative `Row` list (steppers, choices, toggles, buttons, notes, stamp grid). Edits change the quick style (`ToolStyle`) **and** the selection, so later annotations inherit the current properties.
 
-Shared state (`EditorState` = `Canvas` + `History` + path + app weakref + child hwnds) lives in `thread_local! HashMap<HWND, Rc<RefCell<EditorState>>>` keyed by **every** editor HWND (parent + toolbar + canvas + edit-text sibling), so each child wndproc can look it up via `editor::window::get_state(GetParent(self))`. Don't add a child window without inserting into that map (and clearing on WM_DESTROY).
+Shared state (`EditorState` = `Canvas` (which owns the `History`) + path + app weakref + child hwnds) lives in `thread_local! HashMap<HWND, Rc<RefCell<EditorState>>>` keyed by **every** editor HWND (parent + toolbar + canvas + edit-text sibling), so each child wndproc can look it up via `editor::window::get_state(GetParent(self))`. Don't add a child window without inserting into that map (and clearing on WM_DESTROY).
 
-When the Text tool commits or the user double-clicks a Text annotation, `editor::text_edit::spawn` creates a Win32 `EDIT` control **as a sibling of the canvas under the editor parent** (not a child of the canvas — DXGI swap chains don't compose with overlapping child windows). It's sub-classed via `SetWindowLongPtrW(GWLP_WNDPROC, ...)`; `VK_RETURN` and `WM_KILLFOCUS` commit, `VK_ESCAPE` cancels.
+When the Text/Callout tool commits or the user double-clicks a Text/Callout/Step, `editor::text_edit::spawn_for` creates a Win32 `EDIT` control **as a sibling of the canvas under the editor parent** (not a child of the canvas — DXGI swap chains don't compose with overlapping child windows). It's sub-classed via `SetWindowLongPtrW(GWLP_WNDPROC, ...)`; `VK_RETURN` and `WM_KILLFOCUS` commit, `VK_ESCAPE` cancels.
 
 ### Crates: windows-sys + windows + windows-numerics
 
@@ -64,28 +69,23 @@ Three FFI deps; they serve different roles:
 
 ### Editor data flow
 
-`editor/annotation.rs` defines `Annotation` (enum of Arrow/Shape/Text/Step/Highlighter/Blur/Magnify/Stamp), `Document` (base bitmap + `Vec<Annotation>` + `next_id` + `next_step_value`), `Point`, `Rect`, `ShapeKind`, `BlurMode`. Every annotation variant has an `id: AnnotationId` field — when pattern-matching, **always use `..`** to skip it (`Annotation::Arrow { start, end, .. }`); forgetting it is a common compile error. `Annotation::Arrow` has an optional `bezier: Option<Point>` (single quadratic control point).
+`editor/annotation.rs` defines `Annotation` (Arrow/Shape/Callout/Text/Step/Highlighter/Blur/Magnify/Stamp/Image), `Document` (base `Rc<Bitmap>` + `base_gen` + `Vec<Annotation>` + `groups` map), `Point`, `Rect` and the geometry helpers. These are `frame()` (the unrotated handle frame), `bounding_box()`, `hit_test()`, `translate[_part]()`, `set_frame()` (resize), `rotation()`, and `edit_points()` / `set_edit_point()` for kind-specific handles. Every variant has an `id` field, so **always use `..`** when pattern-matching.
 
-`editor/history.rs` holds `History` with `undo`/`redo` stacks of `Command` (Insert/Remove/Mutate deltas — not full snapshots).
+`editor/history.rs`: `Command` = Insert / Remove / Mutate / Base (swap the base raster) / Groups / Batch. `history::execute` applies and records a command; drag gestures mutate live, then push a Batch of Mutates on mouse-up.
 
-`editor/canvas.rs` owns the `Document`, the current `Tool`, viewport (scale/offset), and renders via **Direct2D** through `App.gfx.d2d.context`. It owns a `IDXGISwapChain1` per editor and caches an LRU of `ID2D1SolidColorBrush` (8 slots) + an `ID2D1Effect` for `CLSID_D2D1GaussianBlur` + lazy `ID2D1Bitmap1` per bundled stamp. On `D2DERR_RECREATE_TARGET` the canvas drops all device-bound resources and skips the frame; a perfect in-place recovery is a v2.1 task.
+`editor/render.rs`: the `Renderer` (brush LRU, Gaussian/Shadow effects, uploaded bitmaps, pixelate cache). The canvas draws through `draw_document`, and `render::flatten` runs the same code into an offscreen target with tiled CPU readback, so **export is pixel-identical to the canvas**. There is no separate CPU rasterizer any more. Shadows are drawn by recording the annotation into a command list and feeding it to the Shadow effect. Stamps are drawn as colour emoji (DirectWrite `ENABLE_COLOR_FONT`), vector label badges, or user PNGs (`editor/stamps.rs`).
 
-`editor/window.rs` is the **parent** wndproc — menu, child layout (`SetWindowPos` on toolbar + canvas in `WM_SIZE`), and File-menu commands. Toolbar / canvas wndprocs live in `editor/toolbar.rs` / `editor/canvas.rs` respectively.
+`editor/pixels.rs`: CPU raster ops for the Selection and Cut-out tools (polygon masks, transparent/auto-fill, effects, extract/crop, `cut_band` with straight/zigzag/wave seams). All functions are pure, so callers wrap them in `Command::Base`.
 
-`editor/text_edit.rs` hosts the Win32 `EDIT` control for in-place text editing. `spawn(parent, canvas, annotation_id, parent_rect, initial_text, font_size)` creates the EDIT as a sibling of the canvas; the subclassed wndproc commits on Enter / focus-loss (with a `finishing` flag to prevent re-entrant commits during destroy).
-
-`editor/stamps.rs` generates the 4 bundled stamp bitmaps programmatically (vector geometry → BGRA buffer) — cheaper than embedding PNGs and decoding them. The canvas lazy-decodes via `gfx::d2d::upload_bitmap` on first draw, then caches.
-
-`editor/flatten.rs` is a **CPU rasterizer** (`fn flatten(doc) -> Bitmap`) used for export and clipboard. It walks each annotation and writes pixels directly. Text annotations rasterize as placeholder rectangles, Bezier arrows export as straight, Magnify exports as outlines + connector only. These are export-side limitations; the on-screen D2D canvas renders correctly.
+`editor/text_edit.rs` hosts the in-place Win32 `EDIT` for Text, Callout and Step labels (`spawn_for(parent, canvas, TextEditReq)`). It must read the text **before** removing its subclass context, because WM_GETTEXT goes through the subclass.
 
 ### Adding a new tool / annotation variant
 
-1. Add variant to `Annotation` enum (`editor/annotation.rs`) with `id: AnnotationId` field. Update `id()`, `bounding_box()`, `translate()`.
-2. Add to `Tool` enum (`editor/tools/mod.rs`) and add a `commit_drag` match arm that builds the annotation.
-3. Add a `draw_<kind>` method in `editor/canvas.rs::draw_annotation` (D2D path) and call it from the match arm there. If the new variant uses a special drag preview, also extend `draw_preview`.
-4. Add a render arm in `editor/flatten.rs::rasterize` (CPU path for export).
-5. Add (de)serialization in `io/project.rs`: pick a new `TAG_*` byte, add to `write_ann`/`read_ann`. If the variant's data layout changes for an existing tag, bump `VERSION` and gate the new fields on `version >= N` in `read_ann`.
-6. Add an entry to `TOOLS` in `editor/toolbar.rs` so it appears in the toolbar.
+1. Add the variant to `Annotation` and handle it in the geometry helpers in `annotation.rs`.
+2. Add it to `Tool` (+ `Tool::ALL`, `name`, `key`), creation logic in `tools::create_from_drag`, and a glyph in `toolbar::glyph`.
+3. Draw it in `render::Renderer::draw_kind` (canvas and export get it automatically).
+4. (De)serialize it in `io/project.rs`: new `TAG_*`; bump `VERSION` and gate new fields on `version >= N` if an existing layout changes.
+5. Add property rows in `editor/property.rs::rows` / `apply`.
 
 ### Anti-flicker pattern (mandatory for new windows)
 
@@ -97,14 +97,10 @@ Both the editor and the region overlay handle **`WM_ERASEBKGND` → 1** and doub
 - `.frame` project files: little-endian binary, `b"FRAM"` magic + `u16` version + length-prefixed PNG of base image + annotation records keyed by `TAG_*` byte. See `io/project.rs`.
 - Image encode/decode goes through `gfx/gdiplus.rs` (flat `Gdip*` C API, not COM). WIC was attempted and dropped to keep the binary small.
 
-### Where things are NOT yet wired (v2.1 work)
+### Known gaps
 
-- No dedicated property panel — stroke width / font size / blur intensity have working defaults set at commit time but can't be changed from the UI (`ToolStyle::default` in `editor/tools/mod.rs` is the only way to influence them right now).
-- Bezier arrow's control point isn't user-draggable yet — `commit_drag` sets it to a perpendicular midpoint with a sensible default bend.
-- Magnify defaults to a 2× zoom from a centered sub-rect of the drag — no UI to adjust source bounds or factor.
-- Stamp tool always places asset 0; no picker.
-- Callout, Cut-out, polygon / freehand selection, scrolling capture, DXGI Desktop Duplication, presets UI — all still on the spec wish-list.
-- `overlay::window_pick` is a stub that just returns the foreground window.
-- CPU flatten doesn't match D2D canvas: exported PNG/JPG misses text glyph rendering (placeholder rect), Bezier curves (straight), and Magnify's scaled bitmap (outlines + connector only).
+- Scrolling-capture stitching keeps each frame's scrollbar column, which leaves small artefacts.
+- The prompt dialogs use classic (non-themed) Win32 controls: there's no comctl v6 manifest.
+- Auto-fill is interpolation-based, not texture synthesis.
 
-If you're touching the editor render loop, beware: the canvas uses `ID2D1DeviceContext` with `D2D1_BITMAP_OPTIONS_TARGET` on its swap chain's back buffer. Brushes are cached per-color on `Canvas.brushes` (8-slot LRU). Stamps cache per-asset. All of those must be cleared on device loss (`recover` path in `Canvas::render`).
+If you're touching the editor render loop, beware: the canvas uses `ID2D1DeviceContext` with `D2D1_BITMAP_OPTIONS_TARGET` on its swap chain's back buffer, and the device context is shared process-wide. Device-bound resources live in `Renderer` (plus the canvas checker brush / dash style) and are dropped on `D2DERR_RECREATE_TARGET` in `Canvas::render`, which then re-attaches.

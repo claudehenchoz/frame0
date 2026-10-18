@@ -1,241 +1,246 @@
-use crate::error::Result;
+//! Region-selection overlay.
+//!
+//! Mouse: drag to select (release confirms), right-click cancels.
+//! Keys:  Esc cancel · arrows nudge the cursor 1 px (Shift: 10 px) ·
+//!        Enter starts a keyboard selection at the cursor / confirms the
+//!        current one · hold Space while dragging to move the selection ·
+//!        F = whole monitor under the cursor · W = switch to window pick.
+//! Fixed-size mode: a W×H frame follows the cursor; click / Enter confirms.
+
+use super::{Backdrop, lparam_xy};
+use crate::capture::ScreenRect;
 use crate::gfx::bitmap::Bitmap;
-use crate::win::wide;
 use std::cell::RefCell;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    AlphaBlend, BLENDFUNCTION, BitBlt, CreateCompatibleDC, CreatePen, DeleteDC, DeleteObject,
-    HBITMAP, HBRUSH, HDC, HPEN, InvalidateRect, PS_SOLID, PatBlt, Polyline, PAINTSTRUCT, BeginPaint,
-    EndPaint, GetDC, ReleaseDC, SRCCOPY, SelectObject, CreateSolidBrush, FillRect, AC_SRC_OVER,
-    SetBkMode, TRANSPARENT, SetTextColor, TextOutW, CreateFontW, FW_NORMAL, DEFAULT_CHARSET,
-    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH,
+    BeginPaint, COLORONCOLOR, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+    PAINTSTRUCT, SetStretchBltMode, StretchBlt, SRCCOPY,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_SPACE, VK_UP,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    HCURSOR, IDC_CROSS, LoadCursorW, MSG, PostMessageW, RegisterClassExW,
-    SetCursor, ShowWindow, SW_SHOW, TranslateMessage, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WNDCLASSEXW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE,
+    DefWindowProcW, DestroyWindow, GetCursorPos, SetCursorPos, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 
 const CLASS_NAME: &str = "frame.overlay.region";
+const LOUPE_SRC: i32 = 21; // source pixels across (odd → centre pixel)
+const LOUPE_ZOOM: i32 = 6;
+
+pub enum Picked {
+    Rect(ScreenRect),
+    /// User pressed W: continue with the window-pick overlay.
+    Window,
+}
 
 struct State {
-    desktop: HDC, // memory DC holding the captured desktop
-    desktop_bmp: HBITMAP,
-    desktop_old: isize,
-    width: i32,
-    height: i32,
-    origin_x: i32,
-    origin_y: i32,
-    dragging: bool,
+    bd: Backdrop,
+    origin: (i32, i32),
+    fixed: Option<(i32, i32)>,
+    cursor: (i32, i32),
+    dragging: bool, // mouse button held
+    kb_select: bool, // Enter-started keyboard selection
     start: (i32, i32),
     end: (i32, i32),
-    confirmed_rect: Option<(i32, i32, i32, i32)>,
-    cancelled: bool,
-    hwnd: HWND,
+    space: bool,
+    result: Option<Picked>,
+    done: bool,
 }
 
 thread_local! {
-    static STATE: RefCell<Option<*mut State>> = const { RefCell::new(None) };
+    static STATE: RefCell<Option<Box<State>>> = const { RefCell::new(None) };
 }
 
-/// Show a fullscreen overlay covering the virtual screen, displaying `bg` as the backdrop;
-/// return the user's selected rectangle in screen coordinates, or None if cancelled.
-pub fn pick(bg: &Bitmap, virt_bounds: (i32, i32, i32, i32)) -> Result<Option<(i32, i32, i32, i32)>> {
-    unsafe {
-        register_class();
-
-        // Build a memory DC pre-loaded with the desktop bitmap.
-        let screen_dc = GetDC(0);
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        let bmp = create_dib_from_bitmap(bg);
-        let old = SelectObject(mem_dc, bmp as _);
-        ReleaseDC(0, screen_dc);
-
-        let cname = wide(CLASS_NAME);
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST,
-            cname.as_ptr(),
-            wide("frame overlay").as_ptr(),
-            WS_POPUP | WS_VISIBLE,
-            virt_bounds.0,
-            virt_bounds.1,
-            virt_bounds.2,
-            virt_bounds.3,
-            0,
-            0,
-            GetModuleHandleW(core::ptr::null()) as _,
-            core::ptr::null(),
-        );
-
-        let mut st = Box::new(State {
-            desktop: mem_dc,
-            desktop_bmp: bmp,
-            desktop_old: old,
-            width: virt_bounds.2,
-            height: virt_bounds.3,
-            origin_x: virt_bounds.0,
-            origin_y: virt_bounds.1,
-            dragging: false,
-            start: (0, 0),
-            end: (0, 0),
-            confirmed_rect: None,
-            cancelled: false,
-            hwnd,
-        });
-
-        STATE.with(|s| *s.borrow_mut() = Some(&mut *st as *mut State));
-
-        ShowWindow(hwnd, SW_SHOW);
-        SetCursor(LoadCursorW(0, IDC_CROSS));
-
-        // Modal message loop until window destroyed.
-        let mut msg: MSG = core::mem::zeroed();
-        while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-            if msg.message == WM_QUIT {
-                break;
-            }
-        }
-
-        STATE.with(|s| *s.borrow_mut() = None);
-
-        SelectObject(mem_dc, st.desktop_old);
-        DeleteObject(st.desktop_bmp as _);
-        DeleteDC(mem_dc);
-
-        if st.cancelled {
-            return Ok(None);
-        }
-        Ok(st.confirmed_rect)
+/// Show the overlay over the virtual screen with `bg` as the frozen
+/// backdrop. `fixed` switches to fixed-size placement.
+pub fn pick(bg: &Bitmap, virt: (i32, i32, i32, i32), fixed: Option<(i32, i32)>) -> Option<Picked> {
+    if STATE.with(|s| s.borrow().is_some()) {
+        return None;
     }
-}
-
-unsafe fn register_class() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| unsafe {
-        let cname = wide(CLASS_NAME);
-        let wc = WNDCLASSEXW {
-            cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: 0,
-            lpfnWndProc: Some(wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: GetModuleHandleW(core::ptr::null()) as _,
-            hIcon: 0,
-            hCursor: LoadCursorW(0, IDC_CROSS),
-            hbrBackground: 0,
-            lpszMenuName: core::ptr::null(),
-            lpszClassName: cname.as_ptr(),
-            hIconSm: 0,
-        };
-        RegisterClassExW(&wc);
+    let origin = (virt.0, virt.1);
+    let st = Box::new(State {
+        bd: Backdrop::new(bg),
+        origin,
+        fixed: fixed.map(|(w, h)| (w.clamp(1, virt.2), h.clamp(1, virt.3))),
+        cursor: super::cursor_client(origin),
+        dragging: false,
+        kb_select: false,
+        start: (0, 0),
+        end: (0, 0),
+        space: false,
+        result: None,
+        done: false,
     });
+    STATE.with(|s| *s.borrow_mut() = Some(st));
+    unsafe {
+        let hwnd = super::create_window(CLASS_NAME, Some(wndproc), virt);
+        if hwnd == 0 {
+            STATE.with(|s| s.borrow_mut().take());
+            return None;
+        }
+        super::show(hwnd);
+        crate::win::window::modal_loop(0, &|| STATE.with(|s| s.borrow().as_ref().map_or(true, |s| s.done)));
+        if STATE.with(|s| s.borrow().as_ref().is_some_and(|s| s.done)) {
+            // Already destroyed by finish(); nothing to do.
+        } else {
+            DestroyWindow(hwnd);
+        }
+    }
+    STATE.with(|s| s.borrow_mut().take()).and_then(|s| s.result)
 }
 
-unsafe fn create_dib_from_bitmap(bg: &Bitmap) -> HBITMAP {
-    use windows_sys::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS};
-    unsafe {
-        let mut bi: BITMAPINFO = core::mem::zeroed();
-        bi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bi.bmiHeader.biWidth = bg.width as i32;
-        bi.bmiHeader.biHeight = -(bg.height as i32);
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB as u32;
-        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-        let hbmp = CreateDIBSection(
-            0,
-            &bi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            0,
-            0,
-        );
-        if !bits.is_null() {
-            core::ptr::copy_nonoverlapping(bg.bgra.as_ptr(), bits as *mut u8, bg.bgra.len());
+fn norm(a: (i32, i32), b: (i32, i32)) -> (i32, i32, i32, i32) {
+    (a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).abs(), (a.1 - b.1).abs())
+}
+
+impl State {
+    /// Current candidate rect in client coords, if any.
+    fn selection(&self) -> Option<(i32, i32, i32, i32)> {
+        if let Some((fw, fh)) = self.fixed {
+            let x = (self.cursor.0 - fw / 2).clamp(0, (self.bd.w - fw).max(0));
+            let y = (self.cursor.1 - fh / 2).clamp(0, (self.bd.h - fh).max(0));
+            return Some((x, y, fw, fh));
         }
-        hbmp
+        if self.dragging || self.kb_select {
+            return Some(norm(self.start, self.end));
+        }
+        None
     }
+
+    fn to_screen(&self, r: (i32, i32, i32, i32)) -> ScreenRect {
+        (r.0 + self.origin.0, r.1 + self.origin.1, r.2, r.3)
+    }
+}
+
+unsafe fn finish(hwnd: HWND, st: &mut State, result: Option<Picked>) {
+    st.result = result;
+    st.done = true;
+    if st.dragging {
+        st.dragging = false;
+        unsafe { ReleaseCapture() };
+    }
+    unsafe { DestroyWindow(hwnd) };
+}
+
+unsafe fn confirm(hwnd: HWND, st: &mut State) {
+    if let Some(r) = st.selection() {
+        if r.2 >= 2 && r.3 >= 2 {
+            let sr = st.to_screen(r);
+            unsafe { finish(hwnd, st, Some(Picked::Rect(sr))) };
+            return;
+        }
+    }
+    // Too small: drop the selection and keep going.
+    st.dragging = false;
+    st.kb_select = false;
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    let p = STATE.with(|s| *s.borrow());
-    let st = match p {
-        Some(p) => unsafe { &mut *p },
-        None => return unsafe { DefWindowProcW(hwnd, msg, w, l) },
-    };
+    let p = STATE.with(|s| s.borrow_mut().as_mut().map(|b| &mut **b as *mut State));
+    let Some(p) = p else { return unsafe { DefWindowProcW(hwnd, msg, w, l) } };
+    // SAFETY: the box lives until `pick` returns, which only happens after
+    // the modal loop ends; the wndproc is never re-entered for this state.
+    let st = unsafe { &mut *p };
+    if st.done {
+        return unsafe { DefWindowProcW(hwnd, msg, w, l) };
+    }
     unsafe {
         match msg {
             WM_LBUTTONDOWN => {
-                let x = (l & 0xFFFF) as i16 as i32;
-                let y = ((l >> 16) & 0xFFFF) as i16 as i32;
+                let pt = lparam_xy(l);
+                st.cursor = pt;
+                if st.fixed.is_some() {
+                    confirm(hwnd, st);
+                    return 0;
+                }
                 st.dragging = true;
-                st.start = (x, y);
-                st.end = (x, y);
+                st.kb_select = false;
+                st.start = pt;
+                st.end = pt;
                 SetCapture(hwnd);
                 InvalidateRect(hwnd, core::ptr::null(), 0);
                 0
             }
             WM_MOUSEMOVE => {
-                if st.dragging {
-                    let x = (l & 0xFFFF) as i16 as i32;
-                    let y = ((l >> 16) & 0xFFFF) as i16 as i32;
-                    st.end = (x, y);
-                    InvalidateRect(hwnd, core::ptr::null(), 0);
+                let pt = lparam_xy(l);
+                if (st.dragging || st.kb_select) && st.space {
+                    let (dx, dy) = (pt.0 - st.cursor.0, pt.1 - st.cursor.1);
+                    st.start = (st.start.0 + dx, st.start.1 + dy);
+                    st.end = (st.end.0 + dx, st.end.1 + dy);
+                } else if st.dragging || st.kb_select {
+                    st.end = pt;
                 }
+                st.cursor = pt;
+                InvalidateRect(hwnd, core::ptr::null(), 0);
                 0
             }
             WM_LBUTTONUP => {
                 if st.dragging {
-                    st.dragging = false;
                     ReleaseCapture();
-                    let (x0, y0) = st.start;
-                    let (x1, y1) = st.end;
-                    let x = x0.min(x1);
-                    let y = y0.min(y1);
-                    let w = (x1 - x0).abs();
-                    let h = (y1 - y0).abs();
-                    if w >= 2 && h >= 2 {
-                        st.confirmed_rect = Some((
-                            st.origin_x + x,
-                            st.origin_y + y,
-                            w,
-                            h,
-                        ));
-                    } else {
-                        st.cancelled = true;
-                    }
-                    DestroyWindow(hwnd);
+                    st.end = lparam_xy(l);
+                    confirm(hwnd, st);
+                    st.dragging = false;
+                    InvalidateRect(hwnd, core::ptr::null(), 0);
                 }
                 0
             }
-            WM_RBUTTONDOWN | WM_KEYDOWN => {
-                if msg == WM_KEYDOWN && w as i32 != 27 /* VK_ESCAPE */ {
+            WM_RBUTTONDOWN => {
+                finish(hwnd, st, None);
+                0
+            }
+            WM_KEYDOWN => {
+                let vk = w as u16;
+                let step = if GetKeyState(VK_SHIFT as i32) < 0 { 10 } else { 1 };
+                let nudge = match vk {
+                    VK_LEFT => Some((-step, 0)),
+                    VK_RIGHT => Some((step, 0)),
+                    VK_UP => Some((0, -step)),
+                    VK_DOWN => Some((0, step)),
+                    _ => None,
+                };
+                if let Some((dx, dy)) = nudge {
+                    let mut pt = POINT { x: 0, y: 0 };
+                    GetCursorPos(&mut pt);
+                    SetCursorPos(pt.x + dx, pt.y + dy); // WM_MOUSEMOVE follows
                     return 0;
                 }
-                st.cancelled = true;
-                DestroyWindow(hwnd);
+                match vk {
+                    VK_ESCAPE => finish(hwnd, st, None),
+                    VK_RETURN => {
+                        if st.fixed.is_some() || st.dragging || st.kb_select {
+                            confirm(hwnd, st);
+                        } else {
+                            st.kb_select = true;
+                            st.start = st.cursor;
+                            st.end = st.cursor;
+                        }
+                        InvalidateRect(hwnd, core::ptr::null(), 0);
+                    }
+                    VK_SPACE => st.space = true,
+                    0x46 /* F */ => {
+                        let (sx, sy) = (st.cursor.0 + st.origin.0, st.cursor.1 + st.origin.1);
+                        if let Some(m) = crate::capture::monitors::at_point(sx, sy) {
+                            finish(hwnd, st, Some(Picked::Rect((m.x, m.y, m.w, m.h))));
+                        }
+                    }
+                    0x57 /* W */ => finish(hwnd, st, Some(Picked::Window)),
+                    _ => {}
+                }
+                0
+            }
+            WM_KEYUP => {
+                if w as u16 == VK_SPACE {
+                    st.space = false;
+                }
                 0
             }
             WM_PAINT => {
                 paint(hwnd, st);
                 0
             }
-            windows_sys::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => {
-                // Suppress default erase — WM_PAINT double-buffers the entire
-                // window so no transient background is ever visible.
-                1
-            }
-            WM_DESTROY => {
-                PostMessageW(0, WM_QUIT, 0, 0);
-                0
-            }
+            WM_ERASEBKGND => 1,
             _ => DefWindowProcW(hwnd, msg, w, l),
         }
     }
@@ -245,109 +250,65 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     unsafe {
         let mut ps: PAINTSTRUCT = core::mem::zeroed();
         let hdc = BeginPaint(hwnd, &mut ps);
+        let bd = &st.bd;
+        let dc = bd.back_dc();
+        bd.begin();
 
-        // Double-buffer the entire frame. The overlay paints in several steps
-        // (desktop background → tint → re-blit selection → outline → label);
-        // doing them directly to the window causes visible flicker on every
-        // mouse-move. Compose into a memory DC, then BitBlt once at the end.
-        use windows_sys::Win32::Graphics::Gdi::{
-            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateDIBSection,
-            DIB_RGB_COLORS,
-        };
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = CreateCompatibleBitmap(hdc, st.width, st.height);
-        let old_bmp = SelectObject(mem_dc, mem_bmp as _);
-
-        // Desktop background.
-        BitBlt(mem_dc, 0, 0, st.width, st.height, st.desktop, 0, 0, SRCCOPY);
-
-        // Tint pass via AlphaBlend with a 1×1 source DIB.
-        let tint_dc = CreateCompatibleDC(mem_dc);
-        let mut bi: BITMAPINFO = core::mem::zeroed();
-        bi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bi.bmiHeader.biWidth = 1;
-        bi.bmiHeader.biHeight = -1;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB as u32;
-        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-        let tint_bmp = CreateDIBSection(0, &bi, DIB_RGB_COLORS, &mut bits, 0, 0);
-        if !bits.is_null() {
-            *(bits as *mut u32) = 0x8C_00_00_00; // BGRA, dark, alpha~140
-        }
-        let old_tint = SelectObject(tint_dc, tint_bmp as _);
-        let blend = BLENDFUNCTION {
-            BlendOp: 0,
-            BlendFlags: 0,
-            SourceConstantAlpha: 140,
-            AlphaFormat: 0,
-        };
-        AlphaBlend(mem_dc, 0, 0, st.width, st.height, tint_dc, 0, 0, 1, 1, blend);
-        SelectObject(tint_dc, old_tint);
-        DeleteObject(tint_bmp as _);
-        DeleteDC(tint_dc);
-
-        if st.dragging || st.start != st.end {
-            let (x0, y0) = st.start;
-            let (x1, y1) = st.end;
-            let x = x0.min(x1);
-            let y = y0.min(y1);
-            let w = (x1 - x0).abs();
-            let h = (y1 - y0).abs();
-            if w > 0 && h > 0 {
-                BitBlt(mem_dc, x, y, w, h, st.desktop, x, y, SRCCOPY);
-
-                let pen = CreatePen(PS_SOLID as i32, 2, 0x00FF66);
-                let old_pen = SelectObject(mem_dc, pen as _);
-                let pts = [
-                    windows_sys::Win32::Foundation::POINT { x, y },
-                    windows_sys::Win32::Foundation::POINT { x: x + w, y },
-                    windows_sys::Win32::Foundation::POINT { x: x + w, y: y + h },
-                    windows_sys::Win32::Foundation::POINT { x, y: y + h },
-                    windows_sys::Win32::Foundation::POINT { x, y },
-                ];
-                Polyline(mem_dc, pts.as_ptr(), pts.len() as i32);
-                SelectObject(mem_dc, old_pen);
-                DeleteObject(pen as _);
-
-                let dim_text = format!("{}×{}", w, h);
-                let label = wide(&dim_text);
-                let font = CreateFontW(
-                    -14, 0, 0, 0,
-                    FW_NORMAL as i32,
-                    0, 0, 0,
-                    DEFAULT_CHARSET as u32,
-                    OUT_DEFAULT_PRECIS as u32,
-                    CLIP_DEFAULT_PRECIS as u32,
-                    CLEARTYPE_QUALITY as u32,
-                    VARIABLE_PITCH as u32,
-                    wide("Segoe UI").as_ptr(),
-                );
-                let old_font = SelectObject(mem_dc, font as _);
-                SetBkMode(mem_dc, TRANSPARENT as i32);
-                SetTextColor(mem_dc, 0x00FFFFFF);
-                let label_x = (x + 4).max(0);
-                let label_y = if y + h + 4 < st.height { y + h + 4 } else { y - 18 };
-                TextOutW(mem_dc, label_x, label_y, label.as_ptr(), (label.len() - 1) as i32);
-                SelectObject(mem_dc, old_font);
-                DeleteObject(font as _);
-            }
+        let (cx, cy) = st.cursor;
+        let sel = st.selection();
+        if let Some((x, y, w, h)) = sel {
+            bd.reveal(x, y, w, h);
+            bd.outline(x, y, w, h, bd.px(1).max(1), super::ACCENT);
+            let mut dim = (w.to_string(), h.to_string());
+            dim.0.push_str(" × ");
+            dim.0.push_str(&dim.1);
+            let ly = if y + h + bd.px(28) < bd.h { y + h + bd.px(6) } else { (y - bd.px(28)).max(0) };
+            bd.label(x.max(0), ly, &dim.0);
+        } else {
+            // Crosshair guides through the cursor.
+            let br = CreateSolidBrush(0x00A0A0A0);
+            FillRect(dc, &RECT { left: 0, top: cy, right: bd.w, bottom: cy + 1 }, br);
+            FillRect(dc, &RECT { left: cx, top: 0, right: cx + 1, bottom: bd.h }, br);
+            DeleteObject(br as _);
         }
 
-        // Single blit to the window — user only ever sees the composed frame.
-        BitBlt(hdc, 0, 0, st.width, st.height, mem_dc, 0, 0, SRCCOPY);
+        // Loupe + coordinates, offset from the cursor, flipped near edges.
+        let size = LOUPE_SRC * LOUPE_ZOOM;
+        let gap = bd.px(24);
+        let mut lx = cx + gap;
+        let mut ly = cy + gap;
+        if lx + size + bd.px(8) > bd.w {
+            lx = cx - gap - size;
+        }
+        if ly + size + bd.px(60) > bd.h {
+            ly = cy - gap - size - bd.px(30);
+        }
+        let black = CreateSolidBrush(0);
+        FillRect(dc, &RECT { left: lx, top: ly, right: lx + size, bottom: ly + size }, black);
+        DeleteObject(black as _);
+        SetStretchBltMode(dc, COLORONCOLOR as _);
+        let half = LOUPE_SRC / 2;
+        StretchBlt(dc, lx, ly, size, size, bd.clear_dc(), cx - half, cy - half, LOUPE_SRC, LOUPE_SRC, SRCCOPY);
+        // Centre-pixel box.
+        let c = half * LOUPE_ZOOM;
+        super::outline(dc, lx + c, ly + c, LOUPE_ZOOM, LOUPE_ZOOM, 1, 0x00FFFFFF);
+        bd.outline(lx, ly, size, size, 1, super::ACCENT);
 
-        SelectObject(mem_dc, old_bmp);
-        DeleteObject(mem_bmp as _);
-        DeleteDC(mem_dc);
+        let (sx, sy) = (cx + st.origin.0, cy + st.origin.1);
+        let mut text = sx.to_string();
+        text.push_str(", ");
+        text.push_str(&sy.to_string());
+        let (_, lh) = bd.label(lx, ly + size + bd.px(4), &text);
+        if sel.is_none() || st.fixed.is_some() {
+            let hint = if st.fixed.is_some() {
+                "Click / Enter: capture   Esc: cancel"
+            } else {
+                "F: monitor   W: window   Esc: cancel"
+            };
+            bd.label(lx, ly + size + bd.px(8) + lh, hint);
+        }
+
+        bd.present(hdc);
         EndPaint(hwnd, &ps);
     }
-}
-
-#[allow(dead_code)]
-fn _silence_unused() {
-    let _ = AC_SRC_OVER;
-    let _: HBRUSH = 0;
-    let _: HPEN = 0;
-    let _ = (CreateSolidBrush, FillRect, PatBlt);
 }

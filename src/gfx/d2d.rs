@@ -162,20 +162,42 @@ pub fn color_f(c: crate::gfx::color::Color) -> D2D1_COLOR_F {
     }
 }
 
-/// Upload an in-memory BGRA bitmap as an ID2D1Bitmap1 (immutable, drawable).
+/// Upload an in-memory straight-alpha BGRA bitmap as an ID2D1Bitmap1
+/// (immutable, drawable). Pixels are premultiplied on the way in when the
+/// image has any transparency.
 pub fn upload_bitmap(
     ctx: &ID2D1DeviceContext,
     bm: &crate::gfx::bitmap::Bitmap,
 ) -> Result<ID2D1Bitmap1> {
+    let opaque = bm.bgra.chunks_exact(4).all(|p| p[3] == 255);
+    let premul;
+    let data: &[u8] = if opaque {
+        &bm.bgra
+    } else {
+        premul = bm
+            .bgra
+            .chunks_exact(4)
+            .flat_map(|p| {
+                let a = p[3] as u32;
+                [
+                    (p[0] as u32 * a / 255) as u8,
+                    (p[1] as u32 * a / 255) as u8,
+                    (p[2] as u32 * a / 255) as u8,
+                    p[3],
+                ]
+            })
+            .collect::<Vec<u8>>();
+        &premul
+    };
     unsafe {
         let size = windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
-            width: bm.width,
-            height: bm.height,
+            width: bm.width.max(1),
+            height: bm.height.max(1),
         };
         let props = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
             },
             dpiX: 96.0,
             dpiY: 96.0,
@@ -185,7 +207,7 @@ pub fn upload_bitmap(
         let pitch = bm.width * 4;
         Ok(ctx.CreateBitmap(
             size,
-            Some(bm.bgra.as_ptr() as *const _),
+            Some(data.as_ptr() as *const _),
             pitch,
             &props,
         )?)

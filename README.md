@@ -2,31 +2,17 @@
 
 A tiny Windows screenshot + annotation tool. Lives in the system tray, captures regions via a global hotkey, and opens a built-in editor.
 
-Release binary is **~122 KB**, no installer, no runtime dependencies beyond what ships with Windows.
+Release binary is **~308 KB**, no installer, no runtime dependencies beyond what ships with Windows.
 
-## Status
+## Features
 
-This is an MVP of the larger spec in `PROMPT.md`. What works:
-
-- System tray with right-click menu (Take / Edit / Repeat / Exit) and double-click capture.
-- Global hotkey for region capture (default `Ctrl+Win+PgDn`, configurable).
-- Multi-monitor region selection with live dimensions readout.
-- Background pre-warm thread loads D2D / DirectWrite / D3D11 / GDI+ DLLs and primes the system font cache so the first hotkey press is fast.
-- Editor with these tools: Move, Selection (rect), Arrow, Curve (Bezier arrow), Rectangle, Ellipse, Text (with in-place editing), Step, Highlighter, Blur (real Gaussian via Direct2D effect), Redact (opaque solid), Magnify (scaled inset from a source region), Stamp (4 bundled icons: ✓ ✗ ● ★).
-- Canvas renders via **Direct2D** with DirectWrite text — anti-aliased arrows, ellipses, smooth gaussian blur.
-- Six-color palette on the toolbar.
-- Undo / Redo with full history (`Ctrl+Z` / `Ctrl+Y`).
-- File menu: Save Project (`.frame`), Open Project, Export PNG, Export JPG, Copy to Clipboard.
-- Clipboard write produces `CF_DIB` + `CF_DIBV5` + `CF_PNG` so paste works in Paint, Word, browsers, Slack, etc.
-- INI-based config at `%APPDATA%\frame\frame.ini`.
-
-Deferred (listed in the spec, still pending): Callout (rounded body + tails), Cut-out (band removal from the base image), polygon / ellipse / freehand selection shapes, the operations on a selection (delete / fill / invert / content-aware fill), scrolling capture, presets UI, DXGI Desktop Duplication, window-pick UX with hover-highlight, dedicated property panel for tool-specific options (stroke width / font size / blur intensity — defaults are usable but not yet editable from the UI).
-
-Known editor / export caveats:
-- The canvas (on-screen) is D2D anti-aliased; **export and clipboard flatten via the CPU rasterizer**, which doesn't anti-alias and doesn't render text glyphs (text annotations show as outlined placeholder rectangles in exported PNG/JPG). Text content still round-trips through `.frame` save/load.
-- Bezier arrows look curved in the editor and in `.frame` round-trips, but the exported PNG renders them as straight lines.
-- Magnify's exported PNG shows only the outlines + connector line (not the scaled-up bitmap).
-- Bundled stamps (4 of them) are generated programmatically from vector geometry to keep the binary small.
+- **Tray app.** Double-click or `Ctrl+Win+PgDn` (configurable) to capture. Right-click for Take screenshot, Edit screenshot, Capture modes, Presets, Options and Exit.
+- **Capture modes.** Region (with loupe), full screen / per monitor, fixed region, window under the cursor, any open window (even covered or minimized), scrolling capture, delayed, interval, and repeat last. Capture settings can be saved as presets. Output goes to the editor, the clipboard or `Pictures`. Optional cursor, border and shadow effects.
+- **Editor.** Direct2D canvas with zoom/pan.
+  - Annotation tools: Arrow (end styles, curved, shadow), Rectangle, Ellipse, Polygon, Callout, Text, Step markers, Highlighter, Blur / Pixelate / Solid redaction, Stamps (emoji, label badges, your own PNGs in `%APPDATA%\frame\stamps`), Magnify, Cut-out.
+  - Pixel Selection tool: rect, ellipse, polygon or freehand selections, with delete (transparent or auto-fill), crop, invert, effects, copy and move.
+  - Every object is selectable, movable, resizable, rotatable and deletable. Also: multi-select, group/ungroup, copy/paste/duplicate, z-order, undo/redo, flatten.
+- **Output.** PNG/JPG export and clipboard copy are rendered by the same D2D pipeline as the canvas, so what you see is what you get. Blur and pixelate are flagged as reversible on export, with an option to convert them to solid redactions. `.frame` project files keep every layer editable.
 
 ## Install / build
 

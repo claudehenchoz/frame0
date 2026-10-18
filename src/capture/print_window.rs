@@ -2,14 +2,40 @@ use crate::error::{Error, Result};
 use crate::gfx::bitmap::Bitmap;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject,
+    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    SelectObject,
 };
 use windows_sys::Win32::Storage::Xps::PrintWindow;
-const PW_RENDERFULLCONTENT: u32 = 0x00000002;
-use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetWindowRect, IsIconic, IsWindow, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, ShowWindow,
+};
 
+const PW_RENDERFULLCONTENT: u32 = 0x00000002;
+
+/// Capture a window's content even when it is covered by other windows.
+/// Minimized windows are restored without activation, captured and
+/// re-minimized. The result is cropped to the DWM frame bounds so the
+/// invisible resize borders don't show up as black bars.
 pub fn capture(hwnd: HWND) -> Result<Bitmap> {
+    unsafe {
+        if IsWindow(hwnd) == 0 {
+            return Err(Error::msg("window is gone"));
+        }
+        let was_min = IsIconic(hwnd) != 0;
+        if was_min {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // Give the restore animation and the app's repaint a moment.
+            crate::win::window::sleep_ms(350);
+        }
+        let r = grab(hwnd);
+        if was_min {
+            ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+        }
+        r
+    }
+}
+
+unsafe fn grab(hwnd: HWND) -> Result<Bitmap> {
     unsafe {
         let mut rect: RECT = core::mem::zeroed();
         if GetWindowRect(hwnd, &mut rect) == 0 {
@@ -24,45 +50,16 @@ pub fn capture(hwnd: HWND) -> Result<Bitmap> {
         let mem_dc = CreateCompatibleDC(screen_dc);
         let bmp = CreateCompatibleBitmap(screen_dc, w, h);
         let old = SelectObject(mem_dc, bmp as _);
-
-        if PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT) == 0 {
-            SelectObject(mem_dc, old);
-            DeleteObject(bmp as _);
-            DeleteDC(mem_dc);
-            ReleaseDC(0, screen_dc);
-            return Err(Error::msg("PrintWindow failed"));
-        }
-
-        let mut bi: BITMAPINFO = core::mem::zeroed();
-        bi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bi.bmiHeader.biWidth = w;
-        bi.bmiHeader.biHeight = -h;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB as u32;
-        let mut bgra = vec![0u8; (w * h * 4) as usize];
-        GetDIBits(
-            mem_dc,
-            bmp,
-            0,
-            h as u32,
-            bgra.as_mut_ptr() as _,
-            &mut bi,
-            DIB_RGB_COLORS,
-        );
-        for px in bgra.chunks_exact_mut(4) {
-            px[3] = 0xFF;
-        }
-
+        let ok = PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT) != 0;
         SelectObject(mem_dc, old);
+        let full = if ok { Some(super::bitblt::read_dib(mem_dc, bmp, w, h)) } else { None };
         DeleteObject(bmp as _);
         DeleteDC(mem_dc);
         ReleaseDC(0, screen_dc);
+        let full = full.ok_or(Error::msg("PrintWindow failed"))?;
 
-        Ok(Bitmap {
-            width: w as u32,
-            height: h as u32,
-            bgra,
-        })
+        let fb = super::windows::frame_bounds(hwnd);
+        let vis = (fb.left, fb.top, fb.right - fb.left, fb.bottom - fb.top);
+        Ok(super::bitblt::crop(&full, (rect.left, rect.top), vis).unwrap_or(full))
     }
 }

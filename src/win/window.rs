@@ -101,3 +101,29 @@ pub fn post_quit(code: i32) {
 pub unsafe extern "system" fn default_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
+
+/// Nested message loop used by the modal overlays and prompts. Runs until
+/// `done()` returns true. A WM_QUIT received meanwhile is re-posted so the
+/// outer loop still exits. If `dialog` is non-zero, IsDialogMessageW gives
+/// it Tab / Enter / Esc navigation.
+pub fn modal_loop(dialog: HWND, done: &dyn Fn() -> bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsDialogMessageW;
+    unsafe {
+        let mut msg: MSG = core::mem::zeroed();
+        while !done() {
+            if GetMessageW(&mut msg, 0, 0, 0) <= 0 {
+                PostQuitMessage(msg.wParam as i32);
+                break;
+            }
+            if dialog != 0 && IsDialogMessageW(dialog, &msg) != 0 {
+                continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+pub fn sleep_ms(ms: u32) {
+    unsafe { windows_sys::Win32::System::Threading::Sleep(ms) }
+}
