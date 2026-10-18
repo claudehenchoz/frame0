@@ -1,295 +1,260 @@
 # AGENTS.md — AI Coding Agent Guide
 
-This file is the companion to `CLAUDE.md` and provides the detailed reference an AI agent needs to make safe, correct edits across the `frame` codebase. Read `CLAUDE.md` first for high-level project context; use this for per-file patterns, naming conventions, and gotchas.
+The single reference for AI agents working on `frame`: what it is, how to build and test it, how the code is laid out, and the gotchas that cost time. The product spec is `PROMPT.md`.
 
 ---
 
-## Build & Run Nexus
+## What this is
 
-### Commands
+`frame` is a single-binary Windows screenshot + annotation tool: a persistent tray app with a Direct2D editor, written in Rust (nightly), windows-only. v3 implements everything in `PROMPT.md`:
+
+- **Capture.**
+  - Modes: region (loupe, keyboard nudge), full screen / per monitor, fixed region (typed size, optional position), window pick (hover highlight), open-window list (PrintWindow, so covered and minimized windows work), scrolling capture with stitching.
+  - Timing: delayed capture, interval capture, repeat last.
+  - Input from the clipboard or a file.
+  - Presets, include-cursor, effects (border, drop shadow).
+  - Output to the editor, the clipboard or `Pictures\frame-*.png`.
+- **Editor tools.**
+  - Move.
+  - Selection: rect / ellipse / polygon / freehand, with delete (transparent or auto-fill), crop, invert, effects, copy, and lift-to-layer.
+  - Arrow: end styles, cubic bezier with 2 handles, shadow, Shift = H/V.
+  - Rectangle, Ellipse, Polygon.
+  - Callout: multiple tails, corner radius.
+  - Text.
+  - Step: 1,2,3 or A,B,C; editable labels.
+  - Highlighter.
+  - Blur / Pixelate / Solid redaction.
+  - Stamp: emoji, label badges, user PNGs; categories and search.
+  - Magnify: editable source rect and zoom factor.
+  - Cut-out: rows or columns; straight / zigzag / wave seam.
+- **Object operations.** Select, multi-select (Shift-click, marquee), move / resize / rotate handles, delete, copy/paste/duplicate, group/ungroup, z-order, flatten, undo/redo, zoom/pan.
+- **Output.** PNG/JPG/clipboard export goes through the *same* D2D renderer as the canvas (pixel-identical). Blur and pixelate are warned as reversible on export, with an option to convert them to solid. `.frame` projects (format v3) keep every layer editable.
+
+**Not done:** DXGI Desktop Duplication (capture uses BitBlt / PrintWindow).
+
+### Known gaps
+
+- Scrolling-capture stitching keeps each frame's scrollbar column, which leaves small artefacts.
+- Prompt dialogs use classic (unthemed) Win32 controls: there's no comctl v6 manifest, so EDIT cue banners don't show.
+- Auto-fill is interpolation-based (inverse-distance from the four directions + blur), not texture synthesis.
+- GDI+ PNG encode/decode goes through a temp file (`gfx/gdiplus.rs`); an in-memory IStream path was never added.
+- A new capture *replaces* the open editor's document (after a save/discard prompt if dirty); there is only one editor window.
+
+---
+
+## Build & run
 
 | Action | Command | Notes |
 |--------|---------|-------|
-| Type-check | `cargo +nightly check` | Fastest feedback loop; use this as your default |
-| Debug build | `cargo +nightly build` | Produces `target/debug/frame.exe` |
-| Release build | `cargo +nightly build --release` | Produces `target/x86_64-pc-windows-msvc/release/frame.exe` (~90 KB) |
-| Run debug | `cargo +nightly run` | Launches the tray app |
+| Type-check | `cargo +nightly check` | Fastest loop; use as default |
+| Release build | `cargo +nightly build --release` | → `target/x86_64-pc-windows-msvc/release/frame.exe` (~308 KB) |
+| Debug run | `cargo +nightly run` | Launches the tray app |
 
-### Critical gotcha
-
-**Always exit the tray before rebuilding.** The running binary locks the `.exe`. Right-click the tray icon → **Exit**, then rebuild. Otherwise `cargo build` fails with `Access is denied`.
-
-### Prerequisites
-
-```bash
-rustup toolchain install nightly
-rustup component add rust-src --toolchain nightly
-```
-
-Nightly is mandatory. Stable will fail because `.cargo/config.toml` uses `build-std`, `panic=immediate-abort`, `location-detail=none`, `fmt-debug=none`.
-
----
-
-## Module Map
-
-```
-src/main.rs                      → Entry point: init COM + DPI, create App, message loop
-src/app.rs                       → App struct: tray, config, hotkey, editor lifecycle
-src/config.rs                    → INI-based config (GetPrivateProfileStringW)
-src/error.rs                     → Error enum (Hr/Win32/Generic), Result<T>
-│
-├── capture/                     → Screen capture
-│   ├── mod.rs                   → CaptureMode enum, run() dispatcher
-│   ├── bitblt.rs                → BitBlt-based screen/region capture + cursor overlay
-│   ├── monitors.rs              → Monitor list, virtual screen bounds
-│   ├── print_window.rs          → PrintWindow-based window capture
-│   ├── windows.rs               → Window list (EnumWindows)
-│   └── delay.rs                 → Stub; delayed capture deferred
-│
-├── editor/                      → Annotation editor
-│   ├── mod.rs                   → Re-exports
-│   ├── annotation.rs            → Annotation enum, Document, Point, Rect, Color
-│   ├── canvas.rs                → GDI-based rendering, DIB upload, screen↔doc coords
-│   ├── flatten.rs               → CPU rasterizer for export/clipboard
-│   ├── history.rs               → Undo/redo via delta Commands (Insert/Remove/Mutate)
-│   ├── tools/
-│   │   └── mod.rs               → Tool enum, commit_drag(), ToolStyle
-│   ├── toolbar.rs               → Tool list, palette, constants (TOOLBAR_HEIGHT=44)
-│   └── window.rs                → Editor WndProc, toolbar paint, menus, keyboard dispatch
-│
-├── gfx/                         → Graphics infrastructure
-│   ├── mod.rs                   → Gfx struct (D2D + DWrite + GDI+)
-│   ├── bitmap.rs                → Owned BGRA Bitmap struct
-│   ├── color.rs                 → Color struct with named constants
-│   ├── d2d.rs                   → D2D1.1 + D3D11 + DXGI factories (wired but unused by canvas)
-│   ├── dwrite.rs                → DWrite factory + cached text formats
-│   └── gdiplus.rs               → GDI+ thin wrappers (PNG/JPG encode/decode, temp-file bridge)
-│
-├── io/                          → File I/O
-│   ├── mod.rs                   → export_png, export_jpg, copy_to_clipboard (via flatten)
-│   └── project.rs               → .frame binary format (magic "FRAM" + v1 + annotations)
-│
-├── overlay/                     → Fullscreen selection overlays
-│   ├── mod.rs                   → (empty module file)
-│   ├── region.rs                → Drag-rect overlay with dimensions readout
-│   └── window_pick.rs           → Stub (returns foreground window only)
-│
-└── win/                         → Win32 wrappers
-    ├── mod.rs                   → wide(), HWND_NULL
-    ├── clipboard.rs             → CF_DIB + CF_DIBV5 + CF_PNG clipboard write/read
-    ├── com.rs                   → CoInitializeEx/CoUninitialize
-    ├── dialog.rs                → GetOpenFileNameW/GetSaveFileNameW
-    ├── dpi.rs                   → SetProcessDpiAwarenessContext
-    ├── hotkey.rs                → RegisterHotKey/UnregisterHotKey, HotkeySpec
-    ├── tray.rs                  → NOTIFYICONDATAW tray icon + context menu
-    └── window.rs                → RegisterClassExW, CreateWindowExW, message_loop helpers
-```
-
----
-
-## Key Patterns & Conventions
-
-### The `isize` handle gotcha (windows-sys 0.52)
-
-In `windows-sys 0.52`, handle types like `HWND`, `HMENU`, `HICON`, `HCURSOR`, `HBRUSH`, `HBITMAP`, `HDC`, `HMODULE` are **`isize`**, not raw pointers. **Null is `0`**, not `core::ptr::null_mut()`. Checks are `h == 0` / `h != 0`. Function args passing null handles use `0` or `0 as _`.
-
-The `windows 0.61` crate uses typed wrappers (e.g. `HWND(*mut c_void)`) — see `src/error.rs` for the `From<windows::core::Error>` bridge that lets `?` cross between them.
-
-### Anti-flicker pattern (mandatory for all paint paths)
-
-Both `overlay/region.rs` and `editor/window.rs` follow this pattern:
-
-```
-WM_ERASEBKGND → return 1   // suppress default erase
-
-WM_PAINT:
-  BeginPaint
-  CreateCompatibleDC + CreateCompatibleBitmap  // memory DC
-  SelectObject(mem_bmp) into mem_dc
-  ... paint everything into mem_dc ...
-  BitBlt from mem_dc to hdc  // single blit to screen
-  SelectObject(old), DeleteObject(mem_bmp), DeleteDC(mem_dc)
-  EndPaint
-```
-
-**Never paint multiple steps directly to the window HDC** — intermediate fills produce visible flicker on every `WM_MOUSEMOVE` invalidation.
-
-### Editor canvas coordinate system
-
-- The toolbar occupies the top 44 pixels. The canvas's logical origin (0,0) is at device `(0, TOOLBAR_HEIGHT)`.
-- `editor/canvas.rs::render()` paints at logical (0,0). `editor/window.rs::wndproc` applies `SetViewportOrgEx(mem_dc, 0, TOOLBAR_HEIGHT, ...)` before calling render.
-- `screen_to_doc(x, y)` converts device coords to document coords: subtract `view_offset`, divide by `view_scale`.
-
-### Adding a new annotation tool
-
-The 6-step checklist from CLAUDE.md:
-
-1. **`editor/annotation.rs`** — Add variant to `Annotation` enum with `id: AnnotationId` field. Update `id()`, `bounding_box()`, `translate()`.
-2. **`editor/tools/mod.rs`** — Add to `Tool` enum, add `commit_drag` match arm.
-3. **`editor/canvas.rs`** — Add `draw_<kind>` method, call from `draw_annotation()` match.
-4. **`editor/flatten.rs`** — Add rasterize arm (CPU path for export/clipboard).
-5. **`io/project.rs`** — Pick new `TAG_*` byte, add to `write_ann()`/`read_ann()`.
-6. **`editor/toolbar.rs`** — Add entry to `TOOLS` slice.
-
-### Undo/redo system
-
-`editor/history.rs` stores delta-based `Command` variants — not full snapshots:
-
-- `Command::Insert { index, ann }` / `Command::Remove { index, ann }` / `Command::Mutate { id, before, after }`
-- `History::undo()` pops from `undo` stack, applies reverse, pushes to `redo`.
-- `History::redo()` pops from `redo`, applies forward, pushes to `undo`.
-- `commit_drag()` returns `Option<Command>`; the editor pushes it to history on mouse-up.
-
-### `.frame` binary format
-
-See `io/project.rs` for the full layout:
-
-```
-0..4    magic "FRAM"
-4..6    u16 version = 1
-6..10   u32 base_png_len
-10..    base PNG bytes
-...     u32 next_id
-...     u32 next_step_value
-...     u32 annotation_count
-...     annotation records (u8 TAG_* + variant payload)
-```
-
-Current tags: `TAG_ARROW=1`, `TAG_SHAPE=2`, `TAG_TEXT=3`, `TAG_STEP=4`, `TAG_HIGHLIGHT=5`, `TAG_BLUR=6`.
-
-### D2D readiness
-
-`Gfx` (in `gfx/mod.rs`) constructs the full D2D/DWrite/D3D11/DXGI stack at startup, but the editor canvas only renders through GDI. The D2D infrastructure is:
-
-- `gfx/d2d.rs` — `D2D::create()` builds `ID2D1Factory1` + `ID3D11Device` + `ID2D1DeviceContext` + swap chain creation helpers
-- `gfx/dwrite.rs` — `DWrite` with cached `IDWriteTextFormat` factory
-- Canvas migration to D2D is a planned upgrade — don't tear out GDI paths until D2D is verified pixel-equivalent
+- **Nightly is mandatory.** `rust-toolchain.toml` pins it; `.cargo/config.toml` uses `-Z build-std` with `panic=immediate-abort`, `location-detail=none`, `fmt-debug=none`, which stable can't satisfy. You need the `rust-src` component (`rustup component add rust-src --toolchain nightly`). The target is hardcoded to `x86_64-pc-windows-msvc`.
+- **Exit the tray before rebuilding.** The running exe is locked, and cargo fails with `failed to remove file … Access is denied`. To exit, right-click the tray icon → Exit, or `frame.exe --cmd 199`.
+- **There are no tests.** A test runner would have to cope with `build-std` + `panic=abort`.
 
 ### Binary-size discipline
 
-Current release ~90 KB. Avoid:
+The ceiling is 1 MB and the target is <500 KB; v3 is ~308 KB.
+- Keep `format!` / `Debug` out of hot paths.
+- No proc-macro crates (`windows-implement`, `serde_derive`, `thiserror`).
+- No new crates without a reason.
+- Measure after non-trivial changes: `ls -la target/x86_64-pc-windows-msvc/release/frame.exe`.
 
-- `format!` / `Debug` in hot paths (they pull in formatting machinery)
-- Proc-macro deps (`windows-implement`, `serde_derive`, `thiserror`)
-- `.cargo/config.toml` already strips aggressively: `panic=immediate-abort`, `location-detail=none`, `fmt-debug=none`
+### Testing the GUI (lessons learned)
 
-Measure after non-trivial additions: `ls target/x86_64-pc-windows-msvc/release/frame.exe`
+There's no test harness; verify by driving the real app:
 
----
-
-## Hot Paths to Be Careful With
-
-| File | Function | Concern |
-|------|----------|---------|
-| `editor/canvas.rs` | `render()` | Called on every WM_PAINT (mouse-move during drag); avoid allocations |
-| `editor/window.rs` | `wndproc` WM_MOUSEMOVE | Invalidates the whole window each frame — keep `render()` lean |
-| `overlay/region.rs` | `paint()` | Same — called per mouse-move during drag |
-| `editor/flatten.rs` | `flatten()` | CPU path for export/clipboard; called on save/export/copy |
-| `capture/bitblt.rs` | `region()` | Hot path on every capture; includes cursor overlay via GDI |
+- **Driving the tray.** `frame.exe --cmd <id> [--pid <pid>]` posts a tray command to a running instance. IDs are the `CMD_*` consts in `app.rs`: e.g. 100 region, 101 full screen, 199 exit.
+- **Isolated config.** `FRAME_INI=<absolute path>` uses a separate ini (and hotkey), so a test instance doesn't clash with the user's.
+- **Driving windows.** Send messages straight to the HWNDs (`WM_LBUTTONDOWN/MOVE/UP` with client coordinates to `frame.editor.canvas`, `WM_KEYDOWN` for tool letters, `WM_COMMAND` with the editor's `CMD_*` to `frame.editor`). Avoid global synthetic input on the user's desktop: it can land in their terminal.
+- **Finding windows.** From PowerShell, ANSI `FindWindow` failed to find frame's windows; enumerate with `EnumChildWindows(IntPtr.Zero, …)` + `GetClassName`. `EnumChildWindows` is recursive: the property panel has its own `Edit` (stamp search), so check `GetParent` when looking for the in-place text EDIT.
+- **Sandbox.** The tool sandbox hides other processes' windows; UI-automation scripts must run unsandboxed. Screenshots: `System.Drawing` `CopyFromScreen` after `SetProcessDPIAware`.
+- **Cleanup.** Kill test instances **by PID only**, never `taskkill /IM frame.exe`.
 
 ---
 
-## Per-File Editing Guide
+## Module map
 
-### `editor/annotation.rs`
-- Every `Annotation` variant **must** have an `id: AnnotationId` field.
-- When matching on variants, always use `..` to skip the id field: `Annotation::Arrow { start, end, .. }`.
-- `Color` fields store pre-multiplied alpha values; `a == 0` means transparent.
-- `ShapeKind::Rectangle` / `ShapeKind::Ellipse`; `BlurMode::Solid` / `BlurMode::Blur`.
-
-### `editor/tools/mod.rs`
-- `Tool::Move` and `Tool::SelectionRect` return `None` from `commit_drag()` (they handle clicks differently).
-- `Tool::Text` allows single-click creation (tiny drag) — creates a default 200×`font_size*1.4` rect.
-- `Tool::Step` auto-increments `doc.next_step_value` on creation.
-
-### `editor/canvas.rs`
-- Uses `unsafe` blocks extensively for GDI calls. Keep unsafe scoped tightly.
-- `rgb_to_colorref()` converts `Color` to GDI's BGR: `(c.r) | (c.g<<8) | (c.b<<16)`.
-- `to_screen()` applies `view_offset + p * view_scale` for rendering.
-- `screen_to_doc()` inverts for mouse-hit calculations.
-- The `_silence_unused` function at the bottom of `window.rs` and `region.rs` is a common pattern to suppress dead-code warnings on symbols imported only for assembly.
-
-### `editor/flatten.rs`
-- CPU rasterizer; every annotation type gets a `raster_*` function.
-- Text is **placeholder only** (bordered rectangle). Text content round-trips via `.frame` files but doesn't render on export. Don't add glyph rasterization unless that's specifically tasked.
-- `raster_box_blur()` is a naive CPU box blur (O(n²×r²)). Works for small regions.
-- `blend()` handles alpha compositing: `dst = src*c.a + dst*(255-c.a)`.
-
-### `editor/window.rs`
-- The toolbar is painted pixel-by-pixel in `paint_toolbar()`. Buttons are 60px wide, swatches are 24px with 6px gaps.
-- Command IDs for the File menu: `CMD_SAVE_PROJECT=200`, `CMD_OPEN_PROJECT=201`, `CMD_EXPORT_PNG=202`, `CMD_EXPORT_JPG=203`, `CMD_COPY=204`, `CMD_CLOSE=205`.
-- Thread-local `EDITOR_STATE_BY_HWND` stores the editor state; the WndProc retrieves it via `state = EDITOR_STATE_BY_HWND.with(...)`.
-- `SetViewportOrgEx` shift by `TOOLBAR_HEIGHT` is applied before `canvas.render()`.
-
-### `editor/toolbar.rs`
-- `TOOLS` order determines toolbar layout. `PALETTE` is 6 colors: RED, BLUE, GREEN, YELLOW, BLACK, WHITE.
-- `TOOLBAR_HEIGHT = 44`, `SWATCH_SIZE = 24`.
-
-### `capture/bitblt.rs`
-- Uses `CreateCompatibleBitmap` + `BitBlt(SRCCOPY|CAPTUREBLT)` for pixel capture.
-- Cursor overlay via `GetCursorInfo` + `DrawIconEx`, offset by the hot spot.
-- After capture, forces alpha to 0xFF: `px[3] = 0xFF` (GDI DCs zero the alpha channel).
-
-### `overlay/region.rs`
-- Fullscreen `WS_POPUP | WS_EX_TOPMOST` overlay on the virtual screen.
-- Double-buffers into a memory DC: paints desktop → dark tint via `AlphaBlend` → clears selection rect → draws green outline + dimension label → single `BitBlt` to screen.
-- Selection confirmed when `w >= 2 && h >= 2`; cancelled on right-click or Escape.
-
-### `io/project.rs`
-- `Reader` struct with `take()`, `u8()`, `u16()`, `u32()`, `f32()` methods simplifies deserialization.
-- Strings: `u32` length prefix + UTF-8 bytes. Colors: 4 bytes RGBA.
-- PNG encoding for the base image goes through a temp file (GDI+ limitation). The comment at `encode_png_bytes` says in-memory IStream path is deferred to v1.5.
-
-### `gfx/gdiplus.rs`
-- GDI+ startup/shutdown via `GdiplusStartup`/`GdiplusShutdown`.
-- PNG/JPG encode uses `GdipSaveImageToFile` (file path, not IStream).
-- `encode_png_bytes()` writes to a temp file, reads back, deletes temp.
-- `decode_file()` / `decode_bytes()` reverse the process.
-- `BitmapData` locking reads pixels from a loaded image.
-- The `PixelFormat32bppARGB` constant is hardcoded as `2498570` (0x0026200A) to avoid pulling in GDI+ enum definitions.
-
-### `win/clipboard.rs`
-- Sets `CF_DIB` (BITMAPINFOHEADER + pixels), `CF_DIBV5` (BITMAPV5HEADER with masks + sRGB), and `CF_PNG` (registered format).
-- `set_global()` allocates global memory, locks, copies, unlocks, and calls `SetClipboardData`.
-- Clipboard read prefers `CF_PNG` first, falls back to `CF_DIB`.
-
-### `win/hotkey.rs`
-- `HotkeySpec` holds `mods` (bitfield of `MOD_CONTROL|MOD_ALT|MOD_SHIFT|MOD_WIN|MOD_NOREPEAT`) and `vk` (virtual key code).
-- `parse()` decodes strings like `"Ctrl+Win+PgDn"` — handles `ctrl/control`, `alt`, `shift`, `win/windows/super/meta`, F-keys, navigation keys, `printscreen`, single alphanumeric chars.
-
-### `win/tray.rs`
-- Shell_NotifyIconW with `NIF_ICON | NIF_MESSAGE | NIF_TIP`. Callback message is `WM_TRAY` (`WM_APP+1`).
-- Context menu uses `CreatePopupMenu` + `AppendMenuW` + `TrackPopupMenu(TPM_RETURNCMD)`.
-- `taskbar_created_msg` is registered via `RegisterWindowMessageW("TaskbarCreated")` — re-adds tray icon after Explorer restart.
+```
+src/main.rs                 Entry: --cmd forwarding, prewarm thread, COM + DPI init, App::run
+src/app.rs                  App: tray message window, tray menu (Menu builder), CMD_* ids,
+                            run_capture pipeline (delay timer → grab → effects → output),
+                            presets, interval timer, hotkey, editor lifecycle
+src/config.rs               frame.ini (GetPrivateProfileStringW), options + presets, FRAME_INI
+src/error.rs                Error (Hr / Win32 / Generic), Result; From<windows::core::Error>
+│
+├── capture/
+│   ├── mod.rs              CaptureSettings, Mode, Output, FX_* flags, ScreenRect
+│   ├── bitblt.rs           BitBlt screen/region grab (+ cursor composite)
+│   ├── monitors.rs         Monitor list, virtual-screen bounds
+│   ├── print_window.rs     PrintWindow(PW_RENDERFULLCONTENT) window grab
+│   ├── windows.rs          Capturable top-level window list (filters cloaked/tool/etc.)
+│   ├── effects.rs          Border / drop-shadow post effects
+│   └── scrolling.rs        Scrolling capture: wheel-scroll + overlap detection + stitch
+│
+├── overlay/
+│   ├── mod.rs              Shared Backdrop (frozen, pre-dimmed snapshot DCs), helpers
+│   ├── region.rs           Region / fixed-size picker (loupe, nudge, F = monitor, W = window)
+│   └── window_pick.rs      Hover-highlight window picker (DWM frame bounds, top-most hit)
+│
+├── editor/
+│   ├── annotation.rs       Annotation enum, Document, Point, Rect, geometry/hit-test helpers
+│   ├── history.rs          Command (Insert/Remove/Mutate/Base/Groups/Batch), History, execute
+│   ├── tools/mod.rs        Tool enum (+ALL, name, key), ToolStyle (quick style), creation logic
+│   ├── canvas.rs           Canvas child window: swap chain, view, Gesture state machine, ops
+│   ├── render.rs           Renderer (D2D drawing of all annotations) + flatten() for export
+│   ├── pixels.rs           CPU raster ops: selection masks, fill/auto-fill, effects, cut_band
+│   ├── stamps.rs           Stamp catalogue (emoji/label built-ins, user folder, search)
+│   ├── text_edit.rs        In-place Win32 EDIT for Text / Callout / Step labels
+│   ├── toolbar.rs          Toolbar child (GDI): Fluent-icon tool buttons, palette, undo/redo
+│   ├── property.rs         Property panel child (GDI): declarative rows, stamp grid
+│   ├── layout.rs           Child rects: TOOLBAR_HEIGHT = 44, PROPERTY_WIDTH = 224
+│   └── window.rs           EditorWindow parent: menus, CMD_* ids, accelerators, save/export
+│
+├── gfx/
+│   ├── mod.rs              Gfx (D2D + DWrite + GDI+ token), created once on App
+│   ├── d2d.rs              D3D11/DXGI/D2D1.1 device context, swap chains, upload_bitmap
+│   ├── dwrite.rs           DWrite factory + cached text formats
+│   ├── gdiplus.rs          Flat Gdip* API: PNG/JPG encode/decode (temp-file bridge)
+│   ├── prewarm.rs          Background LoadLibrary of d2d1/dwrite/d3d11/gdiplus + font cache
+│   ├── bitmap.rs           Owned BGRA Bitmap (straight alpha, top-down)
+│   └── color.rs            Color (+ palette and UI theme constants, COLORREF conversion)
+│
+├── io/project.rs           .frame read/write (v3; reads v1/v2)
+│
+└── win/
+    ├── tray.rs             Shell_NotifyIcon, balloon, tooltip, TaskbarCreated re-add
+    ├── prompt.rs           prompt::ask(owner, title, &[(label, init)]) modal input dialog
+    ├── hotkey.rs           HotkeySpec, parse("Ctrl+Win+PgDn"), Register/UnregisterHotKey
+    ├── clipboard.rs        write CF_DIBV5 + CF_DIB + "PNG"; read PNG then CF_DIB
+    ├── dialog.rs           GetOpenFileNameW / GetSaveFileNameW
+    ├── window.rs           register_class / create_window / message_loop helpers
+    ├── com.rs, dpi.rs      COM apartment, per-monitor-v2 DPI awareness
+    └── mod.rs              wide()
+```
 
 ---
 
-## File I/O & Persistence
+## Architecture
 
-| Data | Format | Path | Code |
-|------|--------|------|------|
-| Config | INI | `%APPDATA%\frame\frame.ini` | `config.rs` via `GetPrivateProfileStringW` |
-| Projects | `.frame` binary | User-chosen | `io/project.rs` |
-| Exports | PNG / JPG | User-chosen | `io/mod.rs` → `gfx/gdiplus.rs` |
+### Process model
+
+Single binary, single instance, persistent tray. `main.rs` first handles `--cmd` forwarding, then spawns `gfx::prewarm::spawn()`. Then it creates `App`, which owns a hidden `HWND_MESSAGE` window that receives:
+- `WM_HOTKEY` (id 1) → region capture.
+- `WM_TRAY` (`WM_APP+1`) → double-click capture / right-click menu.
+- `WM_COMMAND` → tray commands.
+- `WM_TIMER` → delay countdown / interval capture.
+- `TaskbarCreated` → re-add the tray icon.
+
+**Capture flow.** Every capture (hotkey, menu, preset, repeat, interval) builds a `CaptureSettings` and calls `App::run_capture`:
+1. Optional delay timer, with the countdown in the tray tooltip.
+2. `grab`: interactive modes snapshot the screen after the delay and show an overlay on the frozen image.
+3. Record the resolved rect / window as "last capture".
+4. `capture::effects::apply`.
+5. `output` → editor (`open_editor` / `open_document`), clipboard, or file.
+
+Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). Hotkey registration failure is non-fatal (warning balloon).
+
+### Editor window topology
+
+`EditorWindow` is a top-level parent with three children:
+- **Toolbar** (`frame.editor.toolbar`). GDI, double-buffered. Tool icons are Segoe Fluent Icons glyphs, falling back to Segoe MDL2 Assets on Windows 10 (detected with `GetTextFaceW`). Palette clicks recolour the selection too.
+- **Canvas** (`frame.editor.canvas`). Owns a DXGI flip-model swap chain and the whole interaction state machine. Has `WS_CLIPSIBLINGS` so the text EDIT sibling shows above it. It has keyboard focus; `window::accelerator` maps Ctrl-shortcuts to menu `CMD_*` ids, which are posted to the parent as `WM_COMMAND`. Plain letters switch tools (`Tool::key`).
+- **Property panel** (`frame.editor.property`). GDI. Built from a declarative `Row` list (`rows()`), laid out by `layout()`, clicks dispatched by `apply()`. It shows the selected annotation's properties, or the tool's when nothing is selected. Edits change the quick style (`ToolStyle`) **and** the selection, so later annotations inherit them. The stamp grid is rendered through `render::flatten` (so emoji are in colour) and cached.
+
+**Shared state.** `EditorState` holds the `Canvas` (which owns `History`), the current path, a weak ref to the app, and the child hwnds. It lives in `thread_local! HashMap<HWND, Rc<RefCell<EditorState>>>`, keyed by the parent **and every child**. Child wndprocs look it up via `window::get_state(GetParent(hwnd))`. If you add a child window, insert it into that map and clear it on `WM_DESTROY`. Use `try_borrow` in paint paths: a modal dialog can re-enter while a borrow is held.
+
+**Text editing.** `text_edit::spawn_for(parent, canvas, TextEditReq)` creates a Win32 `EDIT` as a **sibling of the canvas under the parent** (not a child of the canvas: DXGI swap chains don't compose with overlapping child windows), placed `HWND_TOP`. It's subclassed with `SetWindowLongPtrW(GWLP_WNDPROC)`: Enter / `WM_KILLFOCUS` commit, Esc cancels, Ctrl+Enter inserts a newline. **Read the text before removing the subclass context.** `WM_GETTEXT` is routed through the subclass, which needs the context to reach the original proc; removing it first made every commit read empty text.
+
+### Editor data model
+
+- **`annotation.rs`**
+  - Types:
+    - `Annotation` variants: Arrow, Shape (Rectangle / Ellipse / Polygon), Callout, Text, Step, Highlighter, Blur (Blur / Pixelate / Solid), Magnify, Stamp (string asset id), Image (`Rc<Bitmap>` raster layer).
+    - `Document`: `base: Rc<Bitmap>` plus `base_gen` (bump via `set_base` so renderers re-upload), `annotations`, `next_id`, and a `groups: HashMap<AnnotationId, u32>` side table.
+  - Geometry helpers:
+    - `frame()`: the unrotated handle frame.
+    - `bounding_box()`: everything drawn, axis-aligned.
+    - `hit_test(p, tol)` and `part_at`: Magnify's source and display drag separately.
+    - `translate[_part]`, `set_frame(old, new)` (resize), `rotation` / `set_rotation` / `rotatable`.
+    - `edit_points()` / `set_edit_point()`: arrow endpoints + bezier handles, polygon vertices, callout tail tips, magnifier source corners.
+  - Every variant has an `id` field, so **always use `..`** when pattern-matching.
+- **`history.rs`.** Delta commands, not snapshots. `history::execute` applies and records. Drag gestures mutate the document live, then push a `Batch` of `Mutate`s on mouse-up (`cancel_gesture` restores the originals). `remove_many` builds index-safe Remove batches. `Base` swaps the raster (selection ops, cut-out, flatten).
+- **`tools/mod.rs`.** `create_from_drag(tool, &style, start, end, &doc)` returns an annotation with id 0 (the caller allocates the id). The canvas preview reuses it, so it must not mutate the doc. `constrain()` implements Shift. `next_step()` derives the next marker from existing markers, so it survives undo/delete.
+
+### Rendering (`render.rs`)
+
+- **`Renderer`** owns the device-bound resources: brush LRU, Gaussian / Shadow effects, round stroke style, uploaded base / image / stamp bitmaps, and a pixelate cache. `draw_document(gfx, ctx, doc, world, opts)` paints the base + annotations. Rotation is applied as `rotation_around(center) * world` (D2D multiplies row vectors, local first).
+- **`flatten(gfx, doc, opts)`** renders the same code into an offscreen `TARGET` bitmap, in 4096-px tiles, copies into a `CPU_READ` bitmap, maps it, and un-premultiplies. This is the **only** export path: export / clipboard / copy all use it. Don't reintroduce a CPU rasterizer.
+- **Shadows.** The annotation is recorded into an `ID2D1CommandList`, fed through `CLSID_D2D1Shadow` (drawn offset), then drawn plain.
+- **Blur** = Gaussian effect on the base (border mode HARD), drawn clipped to the bounds. **Pixelate** = a CPU block-average bitmap (`pixels::pixelate_blocks`), cached and drawn scaled with nearest-neighbour. `RenderOpts { secure: true }` draws blur/pixelate as solid fills (the export prompt offers this).
+- **Highlighter** = translucent fill. MIN blending vanishes on dark screenshots, and `D2D1_PRIMITIVE_BLEND_MULTIPLY` doesn't exist in windows 0.61 (only SOURCE_OVER / COPY / MIN / MAX / ADD), so don't go looking for it.
+- **Stamps.** `e:<emoji>` is drawn with DirectWrite `D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` (Segoe UI Emoji); `l:<TEXT>` is a vector rounded badge; `f:<path>` is a user image from `%APPDATA%\frame\stamps\[category\]`. User stamp pixels are embedded in `.frame` files and re-registered with `stamps::register` on load.
+- **Uploads.** `gfx::d2d::upload_bitmap` premultiplies when the bitmap has any alpha < 255 (cut-out / transparent fill / pasted PNGs). The canvas draws a checkerboard behind the page.
+- **Device loss.** On `D2DERR_RECREATE_TARGET`, `Canvas::render` drops the swap chain, target, checker / dash and `Renderer` resources, then re-attaches. The `ID2D1DeviceContext` is shared process-wide; always `SetTarget(None)` after `EndDraw`.
+
+### Canvas interaction (`canvas.rs`)
+
+- **`Gesture`** enum: Pan, Create, Polygon, Freehand, Marquee, Move, Resize, Rotate, EditPoint, SelRect, Band (cut-out), PendingLift (drag inside a pixel selection lifts it into an Image layer, filling the hole).
+- **Handles** are computed in screen space (`handles()`): 8 frame handles (rotated with the object), a rotate handle, and edit points (which win ties). Resizing a rotated object keeps the opposite handle fixed on screen. With a multi-selection you resize the union frame.
+- **Drawing tools** can still grab an already-selected object; otherwise they draw. New annotations become selected. Text/Callout creation returns a `TextEditReq`, which the wndproc spawns *after* releasing the borrow.
+- **Clipboard.** Copy puts the annotations on an internal clipboard *and* a flattened crop on the system clipboard. Paste uses the internal annotations if `GetClipboardSequenceNumber` is unchanged, otherwise pastes a system image as an Image layer.
+- **View.** Fit to the window until the user zooms or pans (`user_view`). Ctrl+wheel zooms at the cursor, wheel / Shift+wheel scroll, Space- or middle-drag pans. `clamp_view` centres small content.
+
+### `.frame` format (`io/project.rs`)
+
+Little-endian:
+1. `b"FRAM"` magic.
+2. `u16` version (3).
+3. `u32` length + PNG of the base image.
+4. `next_id`, `next_step_value`.
+5. `u32` count + records (`u8 TAG_*`, `u32 id`, payload).
+6. v3: `u32` count + (id, group) pairs.
+
+Tags 1–10: Arrow, Shape, Text, Step, Highlight, Blur, Magnify, Stamp, Callout, Image. v2 quadratic arrow control points are converted to cubic on load; v1/v2 numeric stamp indices map through `stamps::legacy_asset`. If an existing layout changes, bump `VERSION` and gate the new fields on `version >= N`.
+
+### Persistence (`config.rs`)
+
+- **Ini path.** `%APPDATA%\frame\frame.ini` (or `FRAME_INI`), written with a UTF-16 BOM so non-ASCII preset names survive.
+- **Sections.**
+  - `[hotkey] capture`: default `Ctrl+Win+PgDn`.
+  - `[capture]`: `include_cursor`, `delay`, `interval`, `output` (`editor` / `clipboard` / `file`), `effects` (bitflags), `fixed_w`, `fixed_h`.
+  - `[ui] last_export_dir`.
+  - `[preset.N]`: name + all settings. An interactively dragged region is stored as a fixed region.
+- **Image codecs.** Go through flat GDI+ (`gfx/gdiplus.rs`). WIC was tried and dropped for size.
 
 ---
 
-## Known Deferred Features (Don't Assume They Exist)
+## Key patterns & gotchas
 
-From the full spec in `PROMPT.md`; **not yet implemented**:
+- **windows-sys 0.52 handles are `isize`** (HWND, HMENU, HICON, HCURSOR, HBRUSH, HBITMAP, HDC, HMODULE). Null is `0`; check with `h == 0` / `h != 0`, never `.is_null()`; pass `0` or `0 as _`. This burns hours if you forget.
+- **Three FFI crates.**
+  - `windows-sys` for flat Win32.
+  - `windows 0.61` for COM (D2D / DWrite / D3D11 / DXGI); typed handles like `HWND(*mut c_void)`.
+  - `windows-numerics` for `Vector2 { X, Y }` (capital fields) and `Matrix3x2 { M11..M32 }`.
+  - `?` crosses between them via `From<windows::core::Error>` in `error.rs`.
+- **windows 0.61 Factory1 shadowing.** `ID2D1Factory1` methods shadow the base ones: `CreateStrokeStyle` takes `D2D1_STROKE_STYLE_PROPERTIES1` and returns `ID2D1StrokeStyle1`, and `CreatePathGeometry` returns `ID2D1PathGeometry1`. Use `.into()` / `.cast()`.
+- **D2D rotation units.** `Matrix3x2::rotation_around` takes degrees, clockwise (matches `Point::rotated`).
+- **Anti-flicker (mandatory for GDI windows).** `WM_ERASEBKGND` → 1. Paint everything into a `CreateCompatibleDC` + `CreateCompatibleBitmap` and `BitBlt` once. Never paint several steps straight to the window DC. The overlays share a pre-dimmed `Backdrop` so they don't AlphaBlend every frame.
+- **Re-entrancy.** Modal loops (menus, dialogs, MessageBox) re-enter wndprocs. Don't hold a `RefCell` borrow across them; paint paths use `try_borrow`.
+- **Capture alpha.** GDI zeroes alpha on capture, so `bitblt` / `print_window` force `px[3] = 0xFF`.
 
-- Callout annotation
-- Magnify annotation
-- Cut-out annotation
-- Stamps (predefined shapes)
-- Polygon / freehand selection
-- Bezier arrows
-- Scrolling capture (window scroll capture)
-- Content-aware fill
-- Presets UI
-- DXGI Desktop Duplication (uses BitBlt instead)
-- Window-pick UX with hover highlight (returns foreground window only)
-- In-place text editing (Text annotations are placeholder rectangles)
-- Delayed capture (`capture/delay.rs` is an empty stub)
-- D2D-based canvas rendering (GDI is the only path)
-- In-memory IStream for GDI+ encode/decode (uses temp files)
+### Adding a new tool / annotation variant
+
+1. `annotation.rs`: add the variant (with `id`) and handle it in `id`/`set_id`/`name`/`frame`/`bounding_box`/`hit_test`/`translate_part`/`set_frame` (and rotation / edit points if relevant).
+2. `tools/mod.rs`: add it to `Tool`, `Tool::ALL`, `name`, `key`, plus creation logic in `create_from_drag`. Add a glyph in `toolbar::glyph`.
+3. `render.rs`: draw it in `Renderer::draw_kind`. Canvas *and* export pick it up automatically.
+4. `io/project.rs`: new `TAG_*` in `write_ann` / `read_ann`.
+5. `property.rs`: rows in `rows()`, handling in `apply()`, and `apply_color` if it's colourable.
+
+### Hot paths
+
+| Where | Concern |
+|-------|---------|
+| `Canvas::render_inner` / `Renderer::draw_document` | Every paint (each mouse-move during drags); no per-frame CPU image work. Pixelate is cached; blur runs on the GPU |
+| `canvas.rs` `WM_MOUSEMOVE` | Only invalidates while a gesture is active |
+| `overlay/region.rs` paint | Per mouse-move; uses the shared pre-dimmed backdrop |
+| `render::flatten` | Export / copy / stamp grid; tiled GPU render + readback |
+| `pixels.rs` | Runs once per op on the full base; keep it O(pixels) |
