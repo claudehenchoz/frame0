@@ -1,1 +1,3 @@
 /target
+/installer/*.exe
+/frame0-*-portable.zip

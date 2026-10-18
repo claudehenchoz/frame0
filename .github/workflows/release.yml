@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($tag -ne $cargo) { throw "Tag v$tag does not match Cargo.toml version $cargo" }
+          "version=$tag" >> $env:GITHUB_OUTPUT
+
+      # rust-toolchain.toml pins nightly + rust-src (needed for -Z build-std).
+      - name: Install toolchain
+        run: rustup toolchain install
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis -y --no-progress
+          }
+          "${env:ProgramFiles(x86)}\NSIS" >> $env:GITHUB_PATH
+
+      - name: Build installer
+        run: makensis /V2 /DVERSION=${{ steps.version.outputs.version }} installer\frame0.nsi
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $zip = "frame0-${{ steps.version.outputs.version }}-portable.zip"
+          # Maximum deflate effort: largest match length, 15 optimization passes.
+          7z a -tzip -mx=9 -mfb=258 -mpass=15 $zip .\target\x86_64-pc-windows-msvc\release\frame0.exe .\LICENSE
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-Item $zip, "installer\frame0-*-setup.exe" | Format-Table Name, Length
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/frame0-${{ steps.version.outputs.version }}-setup.exe
+            frame0-${{ steps.version.outputs.version }}-portable.zip
