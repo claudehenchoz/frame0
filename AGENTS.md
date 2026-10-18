@@ -28,7 +28,7 @@ Frame Zero (`frame0`) is a single-binary Windows screenshot + annotation tool: a
   - Magnify: editable source rect and zoom factor.
   - Cut-out: rows or columns; straight / zigzag / wave seam.
 - **Object operations.** Select, multi-select (Shift-click, marquee), move / resize / rotate handles, delete, copy/paste/duplicate, group/ungroup, z-order, flatten, undo/redo, zoom/pan.
-- **Output.** PNG/JPG/clipboard export goes through the *same* D2D renderer as the canvas (pixel-identical). Blur and pixelate are warned as reversible on export, with an option to convert them to solid. `.frame` projects (format v3) keep every layer editable.
+- **Output.** PNG/JPG/clipboard export goes through the *same* D2D renderer as the canvas (pixel-identical). Blur and pixelate are warned as reversible on export, with an option to convert them to solid. `.frame0` projects keep every layer editable.
 
 **Not done:** DXGI Desktop Duplication (capture uses BitBlt / PrintWindow).
 
@@ -122,7 +122,7 @@ src/error.rs                Error (Hr / Win32 / Generic), Result; From<windows::
 │   ├── bitmap.rs           Owned BGRA Bitmap (straight alpha, top-down)
 │   └── color.rs            Color (+ palette and UI theme constants, COLORREF conversion)
 │
-├── io/project.rs           .frame read/write (v3; reads v1/v2)
+├── io/project.rs           .frame0 read/write (v1)
 │
 └── win/
     ├── tray.rs             Shell_NotifyIcon, balloon, tooltip, TaskbarCreated re-add
@@ -191,7 +191,7 @@ Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). H
 - **Shadows.** The annotation is recorded into an `ID2D1CommandList`, fed through `CLSID_D2D1Shadow` (drawn offset), then drawn plain.
 - **Blur** = Gaussian effect on the base (border mode HARD), drawn clipped to the bounds. **Pixelate** = a CPU block-average bitmap (`pixels::pixelate_blocks`), cached and drawn scaled with nearest-neighbour. `RenderOpts { secure: true }` draws blur/pixelate as solid fills (the export prompt offers this).
 - **Highlighter** = translucent fill. MIN blending vanishes on dark screenshots, and `D2D1_PRIMITIVE_BLEND_MULTIPLY` doesn't exist in windows 0.61 (only SOURCE_OVER / COPY / MIN / MAX / ADD), so don't go looking for it.
-- **Stamps.** `e:<emoji>` is drawn with DirectWrite `D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` (Segoe UI Emoji); `l:<TEXT>` is a vector rounded badge; `f:<path>` is a user image from `%APPDATA%\frame0\stamps\[category\]`. User stamp pixels are embedded in `.frame` files and re-registered with `stamps::register` on load.
+- **Stamps.** `e:<emoji>` is drawn with DirectWrite `D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` (Segoe UI Emoji); `l:<TEXT>` is a vector rounded badge; `f:<path>` is a user image from `%APPDATA%\frame0\stamps\[category\]`. User stamp pixels are embedded in `.frame0` files and re-registered with `stamps::register` on load.
 - **Uploads.** `gfx::d2d::upload_bitmap` premultiplies when the bitmap has any alpha < 255 (cut-out / transparent fill / pasted PNGs). The canvas draws a checkerboard behind the page.
 - **Device loss.** On `D2DERR_RECREATE_TARGET`, `Canvas::render` drops the swap chain, target, checker / dash and `Renderer` resources, then re-attaches. The `ID2D1DeviceContext` is shared process-wide; always `SetTarget(None)` after `EndDraw`.
 
@@ -203,19 +203,17 @@ Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). H
 - **Clipboard.** Copy puts the annotations on an internal clipboard *and* a flattened crop on the system clipboard. Paste uses the internal annotations if `GetClipboardSequenceNumber` is unchanged, otherwise pastes a system image as an Image layer.
 - **View.** Fit to the window until the user zooms or pans (`user_view`). Ctrl+wheel zooms at the cursor, wheel / Shift+wheel scroll, Space- or middle-drag pans. `clamp_view` centres small content.
 
-### `.frame` format (`io/project.rs`)
-
-The project extension and `FRAM` magic kept their pre-rename names so existing projects still open.
+### `.frame0` format (`io/project.rs`)
 
 Little-endian:
-1. `b"FRAM"` magic.
-2. `u16` version (3).
+1. `b"FRM0"` magic.
+2. `u16` version (1).
 3. `u32` length + PNG of the base image.
 4. `next_id`, `next_step_value`.
 5. `u32` count + records (`u8 TAG_*`, `u32 id`, payload).
-6. v3: `u32` count + (id, group) pairs.
+6. `u32` count + (id, group) pairs.
 
-Tags 1–10: Arrow, Shape, Text, Step, Highlight, Blur, Magnify, Stamp, Callout, Image. v2 quadratic arrow control points are converted to cubic on load; v1/v2 numeric stamp indices map through `stamps::legacy_asset`. If an existing layout changes, bump `VERSION` and gate the new fields on `version >= N`.
+Tags 1–10: Arrow, Shape, Text, Step, Highlight, Blur, Magnify, Stamp, Callout, Image. Only the current `VERSION` is read; if the layout changes, bump `VERSION` (older files are then rejected unless you add gated reads on `version >= N`).
 
 ### Persistence (`config.rs`)
 

@@ -1,20 +1,16 @@
-//! `.frame` project format. Little-endian binary layout:
+//! `.frame0` project format. Little-endian binary layout:
 //!
 //! ```text
-//! 0..4    magic "FRAM"
-//! 4..6    u16 version (3)
+//! 0..4    magic "FRM0"
+//! 4..6    u16 version (1)
 //! 6..10   u32 base_png_len
 //! 10..    base PNG bytes (encoded via GDI+; full base image)
 //! ...     u32 next_id
 //! ...     u32 next_step_value
 //! ...     u32 annotation_count
 //! ...     annotation records, each: u8 tag + variant-specific payload
-//! ...     (v3) u32 group_count, then (u32 annotation id, u32 group id) pairs
+//! ...     u32 group_count, then (u32 annotation id, u32 group id) pairs
 //! ```
-//!
-//! Older versions (1, 2) are still read: v1 arrows have no bezier, v2 arrows
-//! have a quadratic control point (converted to cubic), and v1/v2 stamps are a
-//! numeric index into the original four bundled stamps.
 
 use crate::editor::annotation::{Annotation, BlurMode, Document, EndStyle, Point, Rect, ShapeKind, Tail};
 use crate::error::{Error, Result};
@@ -23,8 +19,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::rc::Rc;
 
-const MAGIC: &[u8; 4] = b"FRAM";
-const VERSION: u16 = 3;
+const MAGIC: &[u8; 4] = b"FRM0";
+const VERSION: u16 = 1;
 
 const TAG_ARROW: u8 = 1;
 const TAG_SHAPE: u8 = 2;
@@ -71,10 +67,9 @@ pub fn load(path: &str) -> Result<Document> {
         .map_err(|_| Error::msg("project: read failed"))?;
     let mut r = Reader::new(&bytes);
     if r.take(4)? != MAGIC {
-        return Err(Error::msg("not a .frame file"));
+        return Err(Error::msg("not a .frame0 file"));
     }
-    let version = r.u16()?;
-    if version == 0 || version > VERSION {
+    if r.u16()? != VERSION {
         return Err(Error::msg("unsupported project version"));
     }
     let png_len = r.u32()? as usize;
@@ -87,15 +82,13 @@ pub fn load(path: &str) -> Result<Document> {
     doc.next_id = next_id;
     doc.next_step_value = next_step_value;
     for _ in 0..count {
-        doc.annotations.push(read_ann(&mut r, version)?);
+        doc.annotations.push(read_ann(&mut r)?);
     }
-    if version >= 3 {
-        let n = r.u32()?;
-        for _ in 0..n {
-            let id = r.u32()?;
-            let g = r.u32()?;
-            doc.groups.insert(id, g);
-        }
+    let n = r.u32()?;
+    for _ in 0..n {
+        let id = r.u32()?;
+        let g = r.u32()?;
+        doc.groups.insert(id, g);
     }
     // Guard against ids colliding with ones already in the file.
     let max_id = doc.annotations.iter().map(|a| a.id()).max().unwrap_or(0);
@@ -230,33 +223,19 @@ fn write_ann(buf: &mut Vec<u8>, a: &Annotation) -> Result<()> {
     Ok(())
 }
 
-fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
+fn read_ann(r: &mut Reader) -> Result<Annotation> {
     let tag = r.u8()?;
     let id = r.u32()?;
-    let v3 = version >= 3;
     Ok(match tag {
         TAG_ARROW => {
             let start = read_point(r)?;
             let end = read_point(r)?;
             let color = read_color(r)?;
             let stroke = r.f32()?;
-            let bezier = if v3 {
-                if r.u8()? == 1 { Some((read_point(r)?, read_point(r)?)) } else { None }
-            } else if version == 2 && r.u8()? == 1 {
-                // Quadratic → cubic: c1 = s + 2/3(q-s), c2 = e + 2/3(q-e).
-                let q = read_point(r)?;
-                Some((
-                    Point::new(start.x + (q.x - start.x) * 2.0 / 3.0, start.y + (q.y - start.y) * 2.0 / 3.0),
-                    Point::new(end.x + (q.x - end.x) * 2.0 / 3.0, end.y + (q.y - end.y) * 2.0 / 3.0),
-                ))
-            } else {
-                None
-            };
-            let (head, tail, shadow) = if v3 {
-                (EndStyle::from_u8(r.u8()?), EndStyle::from_u8(r.u8()?), r.u8()? != 0)
-            } else {
-                (EndStyle::Arrow, EndStyle::None, false)
-            };
+            let bezier = if r.u8()? == 1 { Some((read_point(r)?, read_point(r)?)) } else { None };
+            let head = EndStyle::from_u8(r.u8()?);
+            let tail = EndStyle::from_u8(r.u8()?);
+            let shadow = r.u8()? != 0;
             Annotation::Arrow { id, start, end, color, stroke, bezier, head, tail, shadow }
         }
         TAG_SHAPE => {
@@ -270,17 +249,12 @@ fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
             let fill = read_color(r)?;
             let stroke = r.f32()?;
             let rotation = r.f32()?;
-            let (shadow, points) = if v3 {
-                let shadow = r.u8()? != 0;
-                let n = r.u32()? as usize;
-                let mut pts = Vec::with_capacity(n.min(4096));
-                for _ in 0..n {
-                    pts.push(read_point(r)?);
-                }
-                (shadow, pts)
-            } else {
-                (false, Vec::new())
-            };
+            let shadow = r.u8()? != 0;
+            let n = r.u32()? as usize;
+            let mut points = Vec::with_capacity(n.min(4096));
+            for _ in 0..n {
+                points.push(read_point(r)?);
+            }
             Annotation::Shape { id, kind, bounds, points, outline, fill, stroke, rotation, shadow }
         }
         TAG_CALLOUT => {
@@ -307,7 +281,7 @@ fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
             text: read_str(r)?,
             color: read_color(r)?,
             size: r.f32()?,
-            rotation: if v3 { r.f32()? } else { 0.0 },
+            rotation: r.f32()?,
         },
         TAG_STEP => Annotation::Step {
             id,
@@ -341,22 +315,17 @@ fn read_ann(r: &mut Reader, version: u16) -> Result<Annotation> {
             color: read_color(r)?,
         },
         TAG_STAMP => {
-            if v3 {
-                let asset = read_str(r)?;
-                let bounds = read_rect(r)?;
-                let rotation = r.f32()?;
-                let n = r.u32()? as usize;
-                let png = r.take(n)?;
-                if !png.is_empty() {
-                    if let Ok(b) = crate::gfx::gdiplus::decode_bytes(png) {
-                        crate::editor::stamps::register(&asset, Rc::new(b));
-                    }
+            let asset = read_str(r)?;
+            let bounds = read_rect(r)?;
+            let rotation = r.f32()?;
+            let n = r.u32()? as usize;
+            let png = r.take(n)?;
+            if !png.is_empty() {
+                if let Ok(b) = crate::gfx::gdiplus::decode_bytes(png) {
+                    crate::editor::stamps::register(&asset, Rc::new(b));
                 }
-                Annotation::Stamp { id, asset, bounds, rotation }
-            } else {
-                let idx = r.u8()?;
-                Annotation::Stamp { id, asset: crate::editor::stamps::legacy_asset(idx).to_string(), bounds: read_rect(r)?, rotation: r.f32()? }
             }
+            Annotation::Stamp { id, asset, bounds, rotation }
         }
         TAG_IMAGE => {
             let bounds = read_rect(r)?;

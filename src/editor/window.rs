@@ -316,7 +316,7 @@ fn confirm_discard(hwnd: HWND, state: &Rc<RefCell<EditorState>>) -> bool {
     let r = unsafe {
         MessageBoxW(
             hwnd,
-            wide("Save changes to this screenshot as a .frame project?").as_ptr(),
+            wide("Save changes to this screenshot as a .frame0 project?").as_ptr(),
             wide("Frame Zero").as_ptr(),
             MB_YESNOCANCEL | MB_ICONWARNING,
         )
@@ -482,7 +482,7 @@ unsafe fn attach_menu(hwnd: HWND) {
         item(file, CMD_NEW_CLIPBOARD, "New from clipboard\tCtrl+N");
         item(file, CMD_OPEN, "Open image or project…\tCtrl+O");
         sep(file);
-        item(file, CMD_SAVE_PROJECT, "Save project (.frame)\tCtrl+S");
+        item(file, CMD_SAVE_PROJECT, "Save project (.frame0)\tCtrl+S");
         item(file, CMD_SAVE_AS, "Save project as…\tCtrl+Shift+S");
         sep(file);
         item(file, CMD_EXPORT_PNG, "Export PNG…\tCtrl+E");
@@ -584,11 +584,11 @@ fn save_project(hwnd: HWND, state: &Rc<RefCell<EditorState>>, force_dialog: bool
     let existing = state.borrow().current_path.clone();
     let path = match existing {
         Some(p) if !force_dialog => Some(p),
-        _ => crate::win::dialog::save_file(hwnd, "Save project", "Frame Zero project|*.frame|All files|*.*", "screenshot.frame").ok().flatten(),
+        _ => crate::win::dialog::save_file(hwnd, "Save project", "Frame Zero project|*.frame0|All files|*.*", "screenshot.frame0").ok().flatten(),
     };
     let Some(mut p) = path else { return false };
-    if !p.to_ascii_lowercase().ends_with(".frame") {
-        p.push_str(".frame");
+    if !p.to_ascii_lowercase().ends_with(".frame0") {
+        p.push_str(".frame0");
     }
     let ok = crate::io::project::save(&state.borrow().canvas.doc, &p).is_ok();
     if ok {
@@ -671,13 +671,13 @@ fn open_file(hwnd: HWND, state: &Rc<RefCell<EditorState>>) {
     let Some(p) = crate::win::dialog::open_file(
         hwnd,
         "Open image or project",
-        "Images and projects|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.frame|Frame project|*.frame|All files|*.*",
+        "Images and projects|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.frame0|Frame Zero project|*.frame0|All files|*.*",
     )
     .ok()
     .flatten() else {
         return;
     };
-    let is_project = p.to_ascii_lowercase().ends_with(".frame");
+    let is_project = p.to_ascii_lowercase().ends_with(".frame0");
     let doc = if is_project {
         crate::io::project::load(&p).ok()
     } else {

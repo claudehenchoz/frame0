@@ -11,7 +11,7 @@ Release binary is **~308 KB**, no installer, no runtime dependencies beyond what
   - Annotation tools: Arrow (end styles, curved, shadow), Rectangle, Ellipse, Polygon, Callout, Text, Step markers, Highlighter, Blur / Pixelate / Solid redaction, Stamps (emoji, label badges, your own PNGs in `%APPDATA%\frame0\stamps`), Magnify, Cut-out.
   - Pixel Selection tool: rect, ellipse, polygon or freehand selections, with delete (transparent or auto-fill), crop, invert, effects, copy and move.
   - Every object is selectable, movable, resizable, rotatable and deletable. Also: multi-select, group/ungroup, copy/paste/duplicate, z-order, undo/redo, flatten.
-- **Output.** PNG/JPG export and clipboard copy are rendered by the same D2D pipeline as the canvas, so what you see is what you get. Blur and pixelate are flagged as reversible on export, with an option to convert them to solid redactions. `.frame` project files keep every layer editable.
+- **Output.** PNG/JPG export and clipboard copy are rendered by the same D2D pipeline as the canvas, so what you see is what you get. Blur and pixelate are flagged as reversible on export, with an option to convert them to solid redactions. `.frame0` project files keep every layer editable.
 
 ## Install / build
 
@@ -74,11 +74,11 @@ last_export_dir =
 
 Hotkey modifiers: `Ctrl`, `Alt`, `Shift`, `Win`. Keys: letters/digits, `F1`–`F12`, `PgUp`, `PgDn`, `Home`, `End`, `Insert`, `Space`, arrow keys, `PrintScreen`.
 
-### `.frame` project files
+### `.frame0` project files
 
 Custom little-endian binary format. Round-trips the base image (as embedded PNG) plus all annotation layers. Open with File → Open Project.
 
-PNG / JPG export is flattened (annotations are rasterized into the base image). The `.frame` file is the only way to come back and edit layers.
+PNG / JPG export is flattened (annotations are rasterized into the base image). The `.frame0` file is the only way to come back and edit layers.
 
 ## License
 

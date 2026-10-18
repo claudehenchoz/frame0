@@ -85,16 +85,6 @@ pub fn label_color(text: &str) -> Color {
     }
 }
 
-/// Map a v1/v2 project's numeric stamp index to the new asset ids.
-pub fn legacy_asset(idx: u8) -> &'static str {
-    match idx {
-        1 => "e:\u{274C}",
-        2 => "e:\u{1F534}",
-        3 => "e:\u{2B50}",
-        _ => "e:\u{2705}",
-    }
-}
-
 pub struct Entry {
     pub id: String,
     pub name: String,

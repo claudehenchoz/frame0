@@ -658,11 +658,11 @@ impl App {
         let path = crate::win::dialog::open_file(
             0,
             "Open image or project",
-            "Images and projects|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.frame|All files|*.*",
+            "Images and projects|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.frame0|All files|*.*",
         );
         self.set_busy(false);
         let Ok(Some(path)) = path else { return };
-        if path.to_ascii_lowercase().ends_with(".frame") {
+        if path.to_ascii_lowercase().ends_with(".frame0") {
             match crate::io::project::load(&path) {
                 Ok(doc) => self.open_document(doc),
                 Err(_) => message(self.hwnd, "Could not open the project file."),
