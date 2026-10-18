@@ -17,7 +17,7 @@
 
 //! D2D-rendered canvas child window.
 //!
-//! The canvas owns its DXGI swap chain and renders through `Renderer`
+//! The canvas owns a GDI-compatible D2D target and renders through `Renderer`
 //! (`editor/render.rs`) using the process-wide `ID2D1DeviceContext`. It also
 //! owns the interaction state machine: object selection (click, Shift-click,
 //! marquee), move / resize / rotate handles, kind-specific edit points
@@ -38,7 +38,7 @@ use crate::gfx::bitmap::Bitmap;
 use crate::gfx::color::Color;
 use crate::gfx::d2d::{color_f, upload_bitmap};
 use std::rc::Rc;
-use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND as WinHWND};
+use windows::Win32::Foundation::D2DERR_RECREATE_TARGET;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_BRUSH_PROPERTIES1, D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_ELLIPSE,
@@ -46,11 +46,10 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_STROKE_STYLE_PROPERTIES1, ID2D1Bitmap1, ID2D1BitmapBrush1, ID2D1Brush, ID2D1DeviceContext,
     ID2D1Image, ID2D1StrokeStyle,
 };
-use windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient};
+use windows_sys::Win32::Graphics::Gdi::{GetDC, InvalidateRect, ReleaseDC, ScreenToClient};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
@@ -126,7 +125,8 @@ pub struct Canvas {
     user_view: bool,
 
     renderer: Renderer,
-    swap: Option<IDXGISwapChain1>,
+    /// GDI-compatible offscreen target, blitted to the window on paint (see
+    /// `D2D::create_gdi_target` for why this isn't a swap chain).
     target: Option<ID2D1Bitmap1>,
     checker: Option<ID2D1BitmapBrush1>,
     dash: Option<ID2D1StrokeStyle>,
@@ -159,7 +159,6 @@ impl Canvas {
             clip_seq: 0,
             user_view: false,
             renderer: Renderer::new(),
-            swap: None,
             target: None,
             checker: None,
             dash: None,
@@ -169,9 +168,7 @@ impl Canvas {
     pub fn attach(&mut self, hwnd: HWND, w: u32, h: u32) -> Result<()> {
         self.hwnd = hwnd;
         self.size = (w.max(1), h.max(1));
-        let (swap, target) = self.gfx.d2d.create_swapchain_target(WinHWND(hwnd as *mut _), self.size.0, self.size.1)?;
-        self.swap = Some(swap);
-        self.target = Some(target);
+        self.target = Some(self.gfx.d2d.create_gdi_target(self.size.0, self.size.1)?);
         self.zoom_fit();
         Ok(())
     }
@@ -187,19 +184,11 @@ impl Canvas {
         } else {
             self.clamp_view();
         }
-        let Some(swap) = self.swap.as_ref() else { return Ok(()) };
-        unsafe {
-            self.target = None;
-            self.gfx.d2d.context.SetTarget(None);
-            swap.ResizeBuffers(
-                0,
-                new.0,
-                new.1,
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
-                windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0),
-            )?;
-            self.target = Some(self.gfx.d2d.target_bitmap_for_swap(swap)?);
+        if self.target.is_none() {
+            return Ok(());
         }
+        self.target = None;
+        self.target = Some(self.gfx.d2d.create_gdi_target(new.0, new.1)?);
         Ok(())
     }
 
@@ -287,13 +276,12 @@ impl Canvas {
     // ---- rendering ----
 
     pub fn render(&mut self) -> Result<()> {
-        if self.target.is_none() || self.swap.is_none() {
+        if self.target.is_none() {
             return Ok(());
         }
         match self.render_inner() {
             Ok(()) => Ok(()),
             Err(Error::Hr(h)) if h == D2DERR_RECREATE_TARGET.0 => {
-                self.swap = None;
                 self.target = None;
                 self.checker = None;
                 self.dash = None;
@@ -369,13 +357,16 @@ impl Canvas {
         let r = r.and_then(|_| self.draw_overlay(&gfx, &ctx));
         unsafe {
             ctx.SetTransform(&identity());
+            let r = r.and_then(|_| {
+                let hdc = GetDC(self.hwnd);
+                let b = gfx.d2d.blit(hdc, self.size.0, self.size.1);
+                ReleaseDC(self.hwnd, hdc);
+                b
+            });
             let end = ctx.EndDraw(None, None);
             ctx.SetTarget(None);
             r?;
             end?;
-        }
-        if let Some(swap) = &self.swap {
-            self.gfx.d2d.present(swap);
         }
         Ok(())
     }

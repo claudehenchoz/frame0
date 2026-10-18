@@ -49,6 +49,7 @@ features = [
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Gdi",
 ]
 
 # D2D point / matrix types live in windows-numerics in windows 0.61+.

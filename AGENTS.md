@@ -104,7 +104,7 @@ src/error.rs                Error (Hr / Win32 / Generic), Result; From<windows::
 │   ├── annotation.rs       Annotation enum, Document, Point, Rect, geometry/hit-test helpers
 │   ├── history.rs          Command (Insert/Remove/Mutate/Base/Groups/Batch), History, execute
 │   ├── tools/mod.rs        Tool enum (+ALL, name, key), ToolStyle (quick style), creation logic
-│   ├── canvas.rs           Canvas child window: swap chain, view, Gesture state machine, ops
+│   ├── canvas.rs           Canvas child window: GDI-blitted D2D target, view, Gesture state machine, ops
 │   ├── render.rs           Renderer (D2D drawing of all annotations) + flatten() for export
 │   ├── pixels.rs           CPU raster ops: selection masks, fill/auto-fill, effects, cut_band
 │   ├── stamps.rs           Stamp catalogue (emoji/label built-ins, user folder, search)
@@ -116,7 +116,7 @@ src/error.rs                Error (Hr / Win32 / Generic), Result; From<windows::
 │
 ├── gfx/
 │   ├── mod.rs              Gfx (D2D + DWrite + GDI+ token), created once on App
-│   ├── d2d.rs              D3D11/DXGI/D2D1.1 device context, swap chains, upload_bitmap
+│   ├── d2d.rs              D3D11/DXGI/D2D1.1 device context, GDI-compatible targets + blit, upload_bitmap
 │   ├── dwrite.rs           DWrite factory + cached text formats
 │   ├── gdiplus.rs          Flat Gdip* API: PNG/JPG encode/decode (temp-file bridge)
 │   ├── prewarm.rs          Background LoadLibrary of d2d1/dwrite/d3d11/gdiplus + font cache
@@ -163,7 +163,7 @@ Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). H
 
 `EditorWindow` is a top-level parent with three children:
 - **Toolbar** (`frame0.editor.toolbar`). GDI, double-buffered. Tool icons are Segoe Fluent Icons glyphs, falling back to Segoe MDL2 Assets on Windows 10 (detected with `GetTextFaceW`). Palette clicks recolour the selection too.
-- **Canvas** (`frame0.editor.canvas`). Owns a DXGI flip-model swap chain and the whole interaction state machine. Has `WS_CLIPSIBLINGS` so the text EDIT sibling shows above it. It has keyboard focus; `window::accelerator` maps Ctrl-shortcuts to menu `CMD_*` ids, which are posted to the parent as `WM_COMMAND`. Plain letters switch tools (`Tool::key`).
+- **Canvas** (`frame0.editor.canvas`). Renders D2D into a GDI-compatible offscreen bitmap and BitBlts it in `WM_PAINT` (no swap chain: D3D presents drive windowed G-SYNC/VRR, so the monitor, cursor included, dropped to the app's frame rate for ~1 s whenever drawing stopped). Owns the whole interaction state machine. Has `WS_CLIPSIBLINGS` so the text EDIT sibling shows above it. It has keyboard focus; `window::accelerator` maps Ctrl-shortcuts to menu `CMD_*` ids, which are posted to the parent as `WM_COMMAND`. Plain letters switch tools (`Tool::key`).
 - **Property panel** (`frame0.editor.property`). GDI. Built from a declarative `Row` list (`rows()`), laid out by `layout()`, clicks dispatched by `apply()`. It shows the selected annotation's properties, or the tool's when nothing is selected. Edits change the quick style (`ToolStyle`) **and** the selection, so later annotations inherit them. The stamp grid is rendered through `render::flatten` (so emoji are in colour) and cached.
 
 **Shared state.** `EditorState` holds the `Canvas` (which owns `History`), the current path, a weak ref to the app, and the child hwnds. It lives in `thread_local! HashMap<HWND, Rc<RefCell<EditorState>>>`, keyed by the parent **and every child**. Child wndprocs look it up via `window::get_state(GetParent(hwnd))`. If you add a child window, insert it into that map and clear it on `WM_DESTROY`. Use `try_borrow` in paint paths: a modal dialog can re-enter while a borrow is held.
@@ -195,7 +195,7 @@ Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). H
 - **Highlighter** = translucent fill. MIN blending vanishes on dark screenshots, and `D2D1_PRIMITIVE_BLEND_MULTIPLY` doesn't exist in windows 0.61 (only SOURCE_OVER / COPY / MIN / MAX / ADD), so don't go looking for it.
 - **Stamps.** `e:<emoji>` is drawn with DirectWrite `D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` (Segoe UI Emoji); `l:<TEXT>` is a vector rounded badge; `f:<path>` is a user image from `%APPDATA%\frame0\stamps\[category\]`. User stamp pixels are embedded in `.frame0` files and re-registered with `stamps::register` on load.
 - **Uploads.** `gfx::d2d::upload_bitmap` premultiplies when the bitmap has any alpha < 255 (cut-out / transparent fill / pasted PNGs). The canvas draws a checkerboard behind the page.
-- **Device loss.** On `D2DERR_RECREATE_TARGET`, `Canvas::render` drops the swap chain, target, checker / dash and `Renderer` resources, then re-attaches. The `ID2D1DeviceContext` is shared process-wide; always `SetTarget(None)` after `EndDraw`.
+- **Device loss.** On `D2DERR_RECREATE_TARGET`, `Canvas::render` drops the target, checker / dash and `Renderer` resources, then re-attaches. The `ID2D1DeviceContext` is shared process-wide; always `SetTarget(None)` after `EndDraw`.
 
 ### Canvas interaction (`canvas.rs`)
 
