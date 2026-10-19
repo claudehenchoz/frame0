@@ -266,7 +266,9 @@ impl Canvas {
                 off.min(MARGIN).max(view - content - MARGIN)
             }
         };
-        self.view_offset = (fix(self.view_offset.0, w, cw), fix(self.view_offset.1, h, ch));
+        // Whole-pixel offsets: centring an odd-sized image lands on .5, and the
+        // linear filter then smears every pixel across two at 100%.
+        self.view_offset = (fix(self.view_offset.0, w, cw).round(), fix(self.view_offset.1, h, ch).round());
     }
 
     fn tol(&self) -> f32 {
