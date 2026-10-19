@@ -188,7 +188,8 @@ fn window_text(hwnd: HWND) -> String {
     }
 }
 
-unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
+/// Owner-drawn push button: OK is the accent button, others are grey.
+pub(crate) unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
     unsafe {
         let primary = dis.CtlID == IDOK as u32;
         let pressed = dis.itemState & ODS_SELECTED != 0;
@@ -212,9 +213,10 @@ unsafe fn draw_button(dis: &DRAWITEMSTRUCT) {
         }
         SetBkMode(hdc, TRANSPARENT as i32);
         SetTextColor(hdc, fg);
-        let text = wide(if primary { "OK" } else { "Cancel" });
+        let mut text = [0u16; 32];
+        let n = GetWindowTextW(dis.hwndItem, text.as_mut_ptr(), text.len() as i32);
         let mut r = dis.rcItem;
-        DrawTextW(hdc, text.as_ptr(), -1, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdc, text.as_ptr(), n, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 }
 

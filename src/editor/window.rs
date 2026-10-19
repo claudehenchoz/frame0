@@ -26,7 +26,6 @@ use crate::editor::layout::{TOOLBAR_HEIGHT, canvas_rect, property_rect, toolbar_
 use crate::editor::pixels::Effect;
 use crate::editor::tools::Tool;
 use crate::error::{Error, Result};
-use crate::gfx::bitmap::Bitmap;
 use crate::win::wide;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -38,7 +37,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CW_USEDEFAULT, CheckMenuItem, CreateMenu, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, EnableMenuItem, GetClientRect,
-    GetMenu, GetSystemMetrics, IDC_ARROW, IDCANCEL, IDYES, LoadCursorW, MB_ICONWARNING,
+    GetMenu, GetSystemMetrics, IDC_ARROW, IDCANCEL, IDNO, IDYES, LoadCursorW, MB_ICONWARNING,
     MB_YESNOCANCEL, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_ENABLED, MF_POPUP, MF_SEPARATOR,
     MF_STRING, MF_UNCHECKED, MessageBoxW, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetMenu,
@@ -93,10 +92,6 @@ fn clear_state(hwnd: HWND) {
 }
 
 impl EditorWindow {
-    pub fn create(app: Rc<App>, bmp: Bitmap) -> Result<Self> {
-        let doc = Document::new(bmp);
-        Self::create_with_doc_impl(app, doc, None)
-    }
     pub fn create_with_doc(app: Rc<App>, doc: Document) -> Result<Self> {
         Self::create_with_doc_impl(app, doc, None)
     }
@@ -177,10 +172,6 @@ impl EditorWindow {
             SetForegroundWindow(self.hwnd);
             BringWindowToTop(self.hwnd);
         }
-    }
-
-    pub fn replace_image(&mut self, bmp: Bitmap) {
-        self.replace_document(Document::new(bmp));
     }
 
     pub fn replace_document(&mut self, doc: Document) {
@@ -356,6 +347,7 @@ pub const CMD_COPY_IMAGE: u16 = 204;
 pub const CMD_CLOSE: u16 = 205;
 pub const CMD_SAVE_AS: u16 = 206;
 pub const CMD_NEW_CLIPBOARD: u16 = 207;
+pub const CMD_SETTINGS: u16 = 208;
 pub const CMD_UNDO: u16 = 210;
 pub const CMD_REDO: u16 = 211;
 pub const CMD_CUT: u16 = 212;
@@ -507,6 +499,8 @@ unsafe fn attach_menu(hwnd: HWND) {
         item(file, CMD_EXPORT_JPG, "Export JPG…\tCtrl+Shift+E");
         item(file, CMD_COPY_IMAGE, "Copy image to clipboard\tCtrl+Shift+C");
         sep(file);
+        item(file, CMD_SETTINGS, "Settings…");
+        sep(file);
         item(file, CMD_CLOSE, "Close\tCtrl+W");
         sub(bar, file, "&File");
 
@@ -602,11 +596,72 @@ pub fn show_context_menu(parent: HWND, x: i32, y: i32) {
     }
 }
 
+/// Where a save / export goes.
+enum Target {
+    Path(String),
+    /// Show the Save dialog prefilled with this name or path.
+    Dialog(String),
+    Cancel,
+}
+
+/// `dir\name` when a default folder is set (created if missing), asking
+/// only if that file already exists.
+fn quick_target(hwnd: HWND, dir: &str, name: &str) -> Target {
+    if dir.is_empty() || std::fs::create_dir_all(dir).is_err() {
+        return Target::Dialog(name.into());
+    }
+    let p = crate::io::naming::join(dir, name);
+    if !std::path::Path::new(&p).exists() {
+        return Target::Path(p);
+    }
+    let mut text = String::from("“");
+    text.push_str(name);
+    text.push_str("” already exists in ");
+    text.push_str(dir);
+    text.push_str(".\n\nReplace it?");
+    let r = unsafe {
+        MessageBoxW(hwnd, wide(&text).as_ptr(), wide("Frame Zero").as_ptr(), MB_YESNOCANCEL | MB_ICONWARNING)
+    };
+    match r {
+        IDYES => Target::Path(p),
+        IDNO => Target::Dialog(p),
+        _ => Target::Cancel,
+    }
+}
+
+/// Resolve a `Target`, running the Save dialog if needed.
+fn resolve(hwnd: HWND, t: Target, title: &str, filter: &str) -> Option<String> {
+    match t {
+        Target::Path(p) => Some(p),
+        Target::Dialog(def) => crate::win::dialog::save_file(hwnd, title, filter, &def).ok().flatten(),
+        Target::Cancel => None,
+    }
+}
+
+/// `(default folder, "frame0 - <capture time><ext>")` for this document.
+fn default_name(state: &Rc<RefCell<EditorState>>, project: bool, ext: &str) -> (String, String) {
+    let st = state.borrow();
+    let dir = st.app.upgrade().map(|a| {
+        let c = a.config.borrow();
+        if project { c.project_dir.clone() } else { c.export_dir.clone() }
+    });
+    let mut name = crate::io::naming::stem(st.canvas.doc.captured);
+    name.push_str(ext);
+    (dir.unwrap_or_default(), name)
+}
+
 fn save_project(hwnd: HWND, state: &Rc<RefCell<EditorState>>, force_dialog: bool) -> bool {
+    const TITLE: &str = "Save project";
+    const FILTER: &str = "Frame Zero project|*.frame0|All files|*.*";
     let existing = state.borrow().current_path.clone();
+    let (dir, name) = default_name(state, true, ".frame0");
     let path = match existing {
         Some(p) if !force_dialog => Some(p),
-        _ => crate::win::dialog::save_file(hwnd, "Save project", "Frame Zero project|*.frame0|All files|*.*", "screenshot.frame0").ok().flatten(),
+        _ if force_dialog => {
+            let def = if dir.is_empty() { name } else { crate::io::naming::join(&dir, &name) };
+            resolve(hwnd, Target::Dialog(def), TITLE, FILTER)
+        }
+        _ => resolve(hwnd, quick_target(hwnd, &dir, &name), TITLE, FILTER),
     };
     let Some(mut p) = path else { return false };
     if !p.to_ascii_lowercase().ends_with(".frame0") {
@@ -652,12 +707,13 @@ fn ask_secure(hwnd: HWND, state: &Rc<RefCell<EditorState>>) -> Option<bool> {
 
 fn export(hwnd: HWND, state: &Rc<RefCell<EditorState>>, jpg: bool) {
     let Some(secure) = ask_secure(hwnd, state) else { return };
-    let (title, filter, def) = if jpg {
-        ("Export JPG", "JPEG image|*.jpg;*.jpeg", "screenshot.jpg")
+    let (title, filter, ext) = if jpg {
+        ("Export JPG", "JPEG image|*.jpg;*.jpeg", ".jpg")
     } else {
-        ("Export PNG", "PNG image|*.png", "screenshot.png")
+        ("Export PNG", "PNG image|*.png", ".png")
     };
-    let Some(mut p) = crate::win::dialog::save_file(hwnd, title, filter, def).ok().flatten() else { return };
+    let (dir, name) = default_name(state, false, ext);
+    let Some(mut p) = resolve(hwnd, quick_target(hwnd, &dir, &name), title, filter) else { return };
     let lower = p.to_ascii_lowercase();
     if jpg && !(lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
         p.push_str(".jpg");
@@ -703,7 +759,11 @@ fn open_file(hwnd: HWND, state: &Rc<RefCell<EditorState>>) {
     let doc = if is_project {
         crate::io::project::load(&p).ok()
     } else {
-        crate::gfx::gdiplus::decode_file(&p).ok().map(Document::new)
+        crate::gfx::gdiplus::decode_file(&p).ok().map(|b| {
+            let mut d = Document::new(b);
+            d.captured = crate::io::naming::file_time(&p);
+            d
+        })
     };
     let Some(doc) = doc else {
         message(hwnd, "Could not open that file.");
@@ -729,6 +789,12 @@ pub fn handle_command(hwnd: HWND, state: &Rc<RefCell<EditorState>>, cmd: u16) {
             }
             CMD_OPEN => open_file(hwnd, state),
             CMD_ABOUT => crate::win::about::show(hwnd),
+            CMD_SETTINGS => {
+                let app = state.borrow().app.upgrade();
+                if let Some(app) = app {
+                    app.edit_settings(hwnd);
+                }
+            }
             CMD_NEW_CLIPBOARD => {
                 let bm = crate::win::clipboard::read_image(hwnd);
                 match bm {

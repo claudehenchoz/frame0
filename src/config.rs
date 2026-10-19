@@ -23,7 +23,9 @@ use crate::capture::{CaptureSettings, Mode, Output};
 use crate::win::hotkey::HotkeySpec;
 use crate::win::wide;
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-use windows_sys::Win32::UI::Shell::{FOLDERID_RoamingAppData, KF_FLAG_CREATE, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_RoamingAppData, FOLDERID_Screenshots, KF_FLAG_CREATE, SHGetKnownFolderPath,
+};
 use windows_sys::core::PWSTR;
 
 const APP_DIR: &str = "frame0";
@@ -31,6 +33,9 @@ const INI_NAME: &str = "frame0.ini";
 /// Pre-rename locations, migrated once.
 const OLD_APP_DIR: &str = "frame";
 const OLD_INI_NAME: &str = "frame.ini";
+/// Ini default marking a `[save]` key as never written (→ the default folder);
+/// `*` can't appear in a path.
+const UNSET: &str = "*";
 pub const DEFAULT_HOTKEY: &str = "Ctrl+Win+PgDn";
 
 pub struct Config {
@@ -46,6 +51,9 @@ pub struct Config {
     pub last_fixed: (i32, i32),
     pub last: Option<CaptureSettings>,
     pub last_export_dir: String,
+    /// Default folders for Ctrl+S / Ctrl+E; empty = always ask.
+    pub project_dir: String,
+    pub export_dir: String,
 }
 
 impl Config {
@@ -72,6 +80,8 @@ impl Config {
             last_fixed: (fw, fh),
             last: read_settings(p, "last"),
             last_export_dir: read_ini_string(p, "ui", "last_export_dir", ""),
+            project_dir: read_save_dir(p, "project_dir"),
+            export_dir: read_save_dir(p, "export_dir"),
             ini_path,
         }
     }
@@ -97,6 +107,13 @@ impl Config {
     pub fn set_last_export_dir(&mut self, dir: &str) {
         self.last_export_dir = dir.into();
         write_ini_string(&self.ini_path, "ui", "last_export_dir", dir);
+    }
+
+    pub fn set_save_dirs(&mut self, project: &str, export: &str) {
+        self.project_dir = project.into();
+        self.export_dir = export.into();
+        write_ini_string(&self.ini_path, "save", "project_dir", project);
+        write_ini_string(&self.ini_path, "save", "export_dir", export);
     }
 
     /// Presets live in `[preset.0]`, `[preset.1]`, … (contiguous).
@@ -208,35 +225,55 @@ pub fn read_settings(path: &str, sec: &str) -> Option<CaptureSettings> {
     Some(s)
 }
 
-/// `%APPDATA%\frame0` (created if missing).
-pub fn app_dir() -> String {
+fn read_save_dir(path: &str, key: &str) -> String {
+    let v = read_ini_string(path, "save", key, UNSET);
+    if v == UNSET { default_screenshots_dir() } else { v }
+}
+
+/// Path of a known folder (created if missing).
+fn known_folder(id: &windows_sys::core::GUID) -> Option<String> {
     let mut path_pw: PWSTR = core::ptr::null_mut();
     unsafe {
         // Best-effort COM init; safe to call multiple times.
         CoInitializeEx(core::ptr::null(), COINIT_APARTMENTTHREADED as u32);
-        let hr = SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_CREATE as u32, 0, &mut path_pw);
-        if hr < 0 || path_pw.is_null() {
-            return String::from(".");
+        let hr = SHGetKnownFolderPath(id, KF_FLAG_CREATE as u32, 0, &mut path_pw);
+        if path_pw.is_null() {
+            return None;
         }
         let mut len = 0;
         while *path_pw.add(len) != 0 {
             len += 1;
         }
-        let mut dir = String::from_utf16_lossy(core::slice::from_raw_parts(path_pw, len));
+        let dir = String::from_utf16_lossy(core::slice::from_raw_parts(path_pw, len));
         // SHGetKnownFolderPath buffer must be freed with CoTaskMemFree
         windows_sys::Win32::System::Com::CoTaskMemFree(path_pw as _);
-        dir.push('\\');
-        let old = format!("{}{}", dir, OLD_APP_DIR);
-        dir.push_str(APP_DIR);
-        if !std::path::Path::new(&dir).exists() && std::path::Path::new(&old).is_dir() {
-            // One-time move of the pre-rename settings + stamps folder.
-            if std::fs::rename(&old, &dir).is_ok() {
-                let _ = std::fs::rename(format!("{}\\{}", dir, OLD_INI_NAME), format!("{}\\{}", dir, INI_NAME));
-            }
-        }
-        let _ = std::fs::create_dir_all(&dir);
-        dir
+        if hr < 0 { None } else { Some(dir) }
     }
+}
+
+/// `Pictures\Screenshots` via the known folder, so a relocated one is honoured.
+pub fn default_screenshots_dir() -> String {
+    known_folder(&FOLDERID_Screenshots).unwrap_or_else(|| {
+        let mut d = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+        d.push_str("\\Pictures\\Screenshots");
+        d
+    })
+}
+
+/// `%APPDATA%\frame0` (created if missing).
+pub fn app_dir() -> String {
+    let Some(mut dir) = known_folder(&FOLDERID_RoamingAppData) else { return String::from(".") };
+    dir.push('\\');
+    let old = format!("{}{}", dir, OLD_APP_DIR);
+    dir.push_str(APP_DIR);
+    if !std::path::Path::new(&dir).exists() && std::path::Path::new(&old).is_dir() {
+        // One-time move of the pre-rename settings + stamps folder.
+        if std::fs::rename(&old, &dir).is_ok() {
+            let _ = std::fs::rename(format!("{}\\{}", dir, OLD_INI_NAME), format!("{}\\{}", dir, INI_NAME));
+        }
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 fn ensure_ini_path() -> String {

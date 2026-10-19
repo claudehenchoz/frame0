@@ -19,11 +19,12 @@
 //!
 //! ```text
 //! 0..4    magic "FRM0"
-//! 4..6    u16 version (1)
+//! 4..6    u16 version (2; 1 is still read)
 //! 6..10   u32 base_png_len
 //! 10..    base PNG bytes (encoded via GDI+; full base image)
 //! ...     u32 next_id
 //! ...     u32 next_step_value
+//! ...     u64 captured (UTC FILETIME; v2+, v1 uses the file's mtime)
 //! ...     u32 annotation_count
 //! ...     annotation records, each: u8 tag + variant-specific payload
 //! ...     u32 group_count, then (u32 annotation id, u32 group id) pairs
@@ -37,7 +38,7 @@ use std::io::{Read, Write};
 use std::rc::Rc;
 
 const MAGIC: &[u8; 4] = b"FRM0";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 const TAG_ARROW: u8 = 1;
 const TAG_SHAPE: u8 = 2;
@@ -60,6 +61,7 @@ pub fn save(doc: &Document, path: &str) -> Result<()> {
 
     buf.extend_from_slice(&doc.next_id.to_le_bytes());
     buf.extend_from_slice(&doc.next_step_value.to_le_bytes());
+    buf.extend_from_slice(&doc.captured.to_le_bytes());
     buf.extend_from_slice(&(doc.annotations.len() as u32).to_le_bytes());
     for a in &doc.annotations {
         write_ann(&mut buf, a)?;
@@ -86,7 +88,8 @@ pub fn load(path: &str) -> Result<Document> {
     if r.take(4)? != MAGIC {
         return Err(Error::msg("not a .frame0 file"));
     }
-    if r.u16()? != VERSION {
+    let version = r.u16()?;
+    if version == 0 || version > VERSION {
         return Err(Error::msg("unsupported project version"));
     }
     let png_len = r.u32()? as usize;
@@ -94,10 +97,17 @@ pub fn load(path: &str) -> Result<Document> {
     let base = crate::gfx::gdiplus::decode_bytes(&png_bytes)?;
     let next_id = r.u32()?;
     let next_step_value = r.u32()?;
+    let captured = if version >= 2 {
+        let lo = r.u32()? as u64;
+        lo | (r.u32()? as u64) << 32
+    } else {
+        crate::io::naming::file_time(path)
+    };
     let count = r.u32()? as usize;
     let mut doc = Document::new(base);
     doc.next_id = next_id;
     doc.next_step_value = next_step_value;
+    doc.captured = captured;
     for _ in 0..count {
         doc.annotations.push(read_ann(&mut r)?);
     }

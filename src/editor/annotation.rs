@@ -762,6 +762,8 @@ pub struct Document {
     pub next_step_value: u32,
     /// Group membership: annotation id → group id. Absent = ungrouped.
     pub groups: HashMap<AnnotationId, u32>,
+    /// When the screenshot was captured (UTC FILETIME); names saved files.
+    pub captured: u64,
 }
 
 impl Document {
@@ -773,6 +775,7 @@ impl Document {
             next_id: 1,
             next_step_value: 1,
             groups: HashMap::new(),
+            captured: crate::io::naming::now(),
         }
     }
 

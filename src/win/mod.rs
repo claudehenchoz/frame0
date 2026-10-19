@@ -22,6 +22,7 @@ pub mod dialog;
 pub mod dpi;
 pub mod hotkey;
 pub mod prompt;
+pub mod settings;
 pub mod tray;
 pub mod window;
 

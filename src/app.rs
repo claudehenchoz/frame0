@@ -61,6 +61,7 @@ const CMD_INTERVAL_START: u16 = 170;
 const CMD_INTERVAL_STOP: u16 = 171;
 const CMD_HOTKEY: u16 = 180;
 const CMD_STAMPS: u16 = 181;
+const CMD_SETTINGS: u16 = 182;
 const CMD_ABOUT: u16 = 190;
 const CMD_EXIT: u16 = 199;
 const CMD_MONITOR: u16 = 200; // + index (< 64)
@@ -295,7 +296,7 @@ impl App {
         let am = Menu::new();
         am.item(CMD_OUT_EDITOR, "Open &editor")
             .item(CMD_OUT_CLIPBOARD, "Copy to &clipboard")
-            .item(CMD_OUT_FILE, "Save to &file (Pictures)");
+            .item(CMD_OUT_FILE, "Save to &file (export folder)");
         let out_cmd = match c.output {
             Output::Editor => CMD_OUT_EDITOR,
             Output::Clipboard => CMD_OUT_CLIPBOARD,
@@ -317,6 +318,7 @@ impl App {
         om.sep();
         om.item(CMD_HOTKEY, "Set &hotkey…");
         om.item(CMD_STAMPS, "Open &stamps folder");
+        om.item(CMD_SETTINGS, "S&ettings…");
         m.sub("&Options", om, true);
 
         m.sep();
@@ -348,7 +350,7 @@ impl App {
             CMD_CANCEL_DELAY => self.cancel_delay(),
             CMD_OPEN_FILE => self.open_file(),
             CMD_PASTE => match crate::win::clipboard::read_image(self.hwnd) {
-                Some(bmp) => self.open_editor(bmp),
+                Some(bmp) => self.open_editor(bmp, crate::io::naming::now()),
                 None => message(self.hwnd, "The clipboard does not contain an image."),
             },
             CMD_SAVE_PRESET => self.save_preset(),
@@ -374,6 +376,7 @@ impl App {
             CMD_INTERVAL_STOP => self.stop_interval(),
             CMD_HOTKEY => self.set_hotkey(),
             CMD_STAMPS => open_stamps_folder(),
+            CMD_SETTINGS => self.edit_settings(0),
             CMD_ABOUT => {
                 self.set_busy(true);
                 crate::win::about::show(0);
@@ -507,6 +510,8 @@ impl App {
     /// notify, don't (re)start the interval.
     fn execute(self: &Rc<Self>, mut s: CaptureSettings, reuse: bool, from_interval: bool) {
         self.set_busy(true);
+        // The screen is frozen (or grabbed) now, even for interactive modes.
+        let captured = crate::io::naming::now();
         let bmp = self.grab(&mut s, reuse);
         self.set_busy(false);
         let Some(bmp) = bmp else { return };
@@ -517,7 +522,7 @@ impl App {
             }
         }
         let bmp = capture::effects::apply(bmp, s.effects);
-        self.output(bmp, s.output, from_interval);
+        self.output(bmp, s.output, from_interval, captured);
     }
 
     /// Capture according to `s`, filling in the resolved rect / window.
@@ -629,9 +634,9 @@ impl App {
 
     // ------------------------------------------------------------- output
 
-    fn output(self: &Rc<Self>, bmp: Bitmap, out: Output, quiet: bool) {
+    fn output(self: &Rc<Self>, bmp: Bitmap, out: Output, quiet: bool, captured: u64) {
         match out {
-            Output::Editor => self.open_editor(bmp),
+            Output::Editor => self.open_editor(bmp, captured),
             Output::Clipboard => {
                 let png = crate::gfx::gdiplus::encode_png_bytes(&bmp).unwrap_or_default();
                 if crate::win::clipboard::write_image(self.hwnd, &bmp, &png).is_ok() && !quiet {
@@ -639,7 +644,11 @@ impl App {
                 }
             }
             Output::File => {
-                let path = build_save_path();
+                let mut dir = self.config.borrow().export_dir.clone();
+                if dir.is_empty() {
+                    dir = crate::config::default_screenshots_dir();
+                }
+                let path = build_save_path(&dir, captured);
                 match crate::gfx::gdiplus::save_png(&bmp, &path) {
                     Ok(()) if !quiet => {
                         let mut t = String::from("Saved ");
@@ -653,16 +662,10 @@ impl App {
         }
     }
 
-    pub fn open_editor(self: &Rc<Self>, bmp: Bitmap) {
-        let mut slot = self.editor.borrow_mut();
-        if let Some(existing) = slot.as_mut() {
-            existing.replace_image(bmp);
-            existing.activate();
-            return;
-        }
-        if let Ok(ed) = EditorWindow::create(self.clone(), bmp) {
-            *slot = Some(ed);
-        }
+    pub fn open_editor(self: &Rc<Self>, bmp: Bitmap, captured: u64) {
+        let mut doc = Document::new(bmp);
+        doc.captured = captured;
+        self.open_document(doc);
     }
 
     pub fn open_document(self: &Rc<Self>, doc: Document) {
@@ -693,7 +696,7 @@ impl App {
             }
         } else {
             match crate::gfx::gdiplus::decode_file(&path) {
-                Ok(bmp) => self.open_editor(bmp),
+                Ok(bmp) => self.open_editor(bmp, crate::io::naming::file_time(&path)),
                 Err(_) => message(self.hwnd, "Could not open the image."),
             }
         }
@@ -753,6 +756,20 @@ impl App {
     }
 
     // -------------------------------------------------------------- hotkey
+
+    /// Settings dialog (default save folders); also opened from the editor.
+    pub fn edit_settings(&self, owner: HWND) {
+        let (p, e) = {
+            let c = self.config.borrow();
+            (c.project_dir.clone(), c.export_dir.clone())
+        };
+        self.set_busy(true);
+        let r = crate::win::settings::show(owner, &p, &e);
+        self.set_busy(false);
+        if let Some((p, e)) = r {
+            self.config.borrow_mut().set_save_dirs(&p, &e);
+        }
+    }
 
     fn set_hotkey(&self) {
         use crate::win::hotkey::{self, HOTKEY_ID_CAPTURE};
@@ -816,23 +833,14 @@ fn open_stamps_folder() {
     }
 }
 
-/// `%USERPROFILE%\Pictures\frame0-YYYY-MM-DD_HH-MM-SS[-n].png`
-fn build_save_path() -> String {
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-    let mut t = unsafe { core::mem::zeroed() };
-    unsafe { GetLocalTime(&mut t) };
-    let dir = std::env::var("USERPROFILE")
-        .map(|h| format!("{}\\Pictures", h))
-        .unwrap_or_else(|_| ".".to_string());
-    let _ = std::fs::create_dir_all(&dir);
-    let base = format!(
-        "{}\\frame0-{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
-        dir, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
-    );
-    let mut path = format!("{}.png", base);
+/// `<dir>\frame0 - YYYY-MM-DD HH-MM-SS[ (n)].png`; never overwrites.
+fn build_save_path(dir: &str, captured: u64) -> String {
+    let _ = std::fs::create_dir_all(dir);
+    let base = crate::io::naming::join(dir, &crate::io::naming::stem(captured));
+    let mut path = base.clone() + ".png";
     let mut n = 2;
     while std::path::Path::new(&path).exists() {
-        path = format!("{}-{}.png", base, n);
+        path = base.clone() + " (" + &n.to_string() + ").png";
         n += 1;
     }
     path

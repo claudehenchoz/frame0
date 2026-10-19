@@ -13,7 +13,7 @@ Frame Zero (`frame0`) is a single-binary Windows screenshot + annotation tool: a
   - Timing: delayed capture, interval capture, repeat last.
   - Input from the clipboard or a file.
   - Presets, include-cursor, effects (border, drop shadow).
-  - Output to the editor, the clipboard or `Pictures\frame0-*.png`.
+  - Output to the editor, the clipboard or a file in the export folder.
 - **Editor tools.**
   - Move.
   - Selection: rect / ellipse / polygon / freehand, with delete (transparent or auto-fill), crop, invert, effects, copy, and lift-to-layer.
@@ -29,6 +29,7 @@ Frame Zero (`frame0`) is a single-binary Windows screenshot + annotation tool: a
   - Cut-out: rows or columns; straight / zigzag / wave seam.
 - **Object operations.** Select, multi-select (Shift-click, marquee), move / resize / rotate handles, delete, copy/paste/duplicate, group/ungroup, z-order, flatten, undo/redo, zoom/pan.
 - **Output.** PNG/JPG/clipboard export goes through the *same* D2D renderer as the canvas (pixel-identical). Blur and pixelate are warned as reversible on export, with an option to convert them to solid. `.frame0` projects keep every layer editable.
+- **Saving.** Files are named `frame0 - YYYY-MM-DD HH-MM-SS.ext` after the *capture* time (`Document::captured`). Settings (tray Options or editor File menu) set default project / export folders, which default to `Pictures\Screenshots`. With a folder set, Ctrl+S / Ctrl+E save straight into it (creating it), asking Replace? Yes / No (Save dialog) / Cancel only if the file exists. An empty folder means always show the dialog.
 
 **Not done:** DXGI Desktop Duplication (capture uses BitBlt / PrintWindow).
 
@@ -46,7 +47,7 @@ Frame Zero (`frame0`) is a single-binary Windows screenshot + annotation tool: a
 | Action | Command | Notes |
 |--------|---------|-------|
 | Type-check | `cargo +nightly check` | Fastest loop; use as default |
-| Release build | `cargo +nightly build --release` | → `target/x86_64-pc-windows-msvc/release/frame0.exe` (~308 KB) |
+| Release build | `cargo +nightly build --release` | → `target/x86_64-pc-windows-msvc/release/frame0.exe` (~340 KB) |
 | Debug run | `cargo +nightly run` | Launches the tray app |
 
 - **Nightly is mandatory.** `rust-toolchain.toml` pins it; `.cargo/config.toml` uses `-Z build-std` with `panic=immediate-abort`, `location-detail=none`, `fmt-debug=none`, which stable can't satisfy. You need the `rust-src` component (`rustup component add rust-src --toolchain nightly`). The target is hardcoded to `x86_64-pc-windows-msvc`.
@@ -57,7 +58,7 @@ Frame Zero (`frame0`) is a single-binary Windows screenshot + annotation tool: a
 
 ### Binary-size discipline
 
-The ceiling is 1 MB and the target is <500 KB; v3 is ~308 KB.
+The ceiling is 1 MB and the target is <500 KB; 0.2.0 is ~340 KB.
 - Keep `format!` / `Debug` out of hot paths.
 - No proc-macro crates (`windows-implement`, `serde_derive`, `thiserror`).
 - No new crates without a reason.
@@ -123,15 +124,17 @@ src/error.rs                Error (Hr / Win32 / Generic), Result; From<windows::
 │   ├── bitmap.rs           Owned BGRA Bitmap (straight alpha, top-down)
 │   └── color.rs            Color (+ palette and UI theme constants, COLORREF conversion)
 │
-├── io/project.rs           .frame0 read/write (v1)
+├── io/project.rs           .frame0 read/write (v2; v1 still read)
+├── io/naming.rs            Capture timestamps (UTC FILETIME), `frame0 - <date time>` file stems
 │
 └── win/
     ├── tray.rs             Shell_NotifyIcon, balloon, tooltip, TaskbarCreated re-add
     ├── prompt.rs           prompt::ask(owner, title, &[(label, init)]) modal input dialog
+    ├── settings.rs         Settings dialog: default project / export folders (+ Browse)
     ├── about.rs            Help → About box (in-memory dialog template, SysLink to GitHub)
     ├── hotkey.rs           HotkeySpec, parse("Ctrl+Win+PgDn"), Register/UnregisterHotKey
     ├── clipboard.rs        write CF_DIBV5 + CF_DIB + "PNG"; read PNG then CF_DIB
-    ├── dialog.rs           GetOpenFileNameW / GetSaveFileNameW
+    ├── dialog.rs           GetOpenFileNameW; IFileSaveDialog (SetFolder) + folder picker
     ├── window.rs           register_class / create_window / message_loop helpers
     ├── com.rs, dpi.rs      COM apartment, per-monitor-v2 DPI awareness
     └── mod.rs              wide()
@@ -209,13 +212,13 @@ Hotkey and tray input are ignored while an overlay or prompt is open (`busy`). H
 
 Little-endian:
 1. `b"FRM0"` magic.
-2. `u16` version (1).
+2. `u16` version (2).
 3. `u32` length + PNG of the base image.
-4. `next_id`, `next_step_value`.
+4. `next_id`, `next_step_value`, then (v2+) `u64 captured` (UTC FILETIME; v1 files use their mtime).
 5. `u32` count + records (`u8 TAG_*`, `u32 id`, payload).
 6. `u32` count + (id, group) pairs.
 
-Tags 1–10: Arrow, Shape, Text, Step, Highlight, Blur, Magnify, Stamp, Callout, Image. Only the current `VERSION` is read; if the layout changes, bump `VERSION` (older files are then rejected unless you add gated reads on `version >= N`).
+Tags 1–10: Arrow, Shape, Text, Step, Highlight, Blur, Magnify, Stamp, Callout, Image. Versions 1..=`VERSION` are read, with gated reads on `version >= N`; if the layout changes, bump `VERSION` and gate the new fields.
 
 ### Persistence (`config.rs`)
 
@@ -224,6 +227,7 @@ Tags 1–10: Arrow, Shape, Text, Step, Highlight, Blur, Magnify, Stamp, Callout,
   - `[hotkey] capture`: default `Ctrl+Win+PgDn`.
   - `[capture]`: `include_cursor`, `delay`, `interval`, `output` (`editor` / `clipboard` / `file`), `effects` (bitflags), `fixed_w`, `fixed_h`.
   - `[ui] last_export_dir`.
+  - `[save]`: `project_dir`, `export_dir`. A missing key means the `FOLDERID_Screenshots` default; an empty value means always ask.
   - `[preset.N]`: name + all settings. An interactively dragged region is stored as a fixed region.
 - **Image codecs.** Go through flat GDI+ (`gfx/gdiplus.rs`). WIC was tried and dropped for size.
 
