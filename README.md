@@ -3,6 +3,8 @@ A tiny Windows screenshot + annotation tool. Lives in the system tray, captures 
 
 Release binary is **~308 KB**, no installer, no runtime dependencies beyond what ships with Windows.
 
+![The Frame Zero editor with step markers, a blurred field, a callout, a highlighter and arrow annotations](docs/editor.png)
+
 ## Features
 
 - **Tray app.** Double-click or `Ctrl+Win+PgDn` (configurable) to capture. Right-click for Take screenshot, Edit screenshot, Capture modes, Presets, Options and Exit.
